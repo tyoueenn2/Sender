@@ -1,0 +1,26 @@
+name: Windows build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake --preset windows-release
+      - name: Build
+        run: cmake --build --preset windows-release --target frame_sender
+      - name: Smoke test
+        run: |
+          .\build\Release\frame_sender.exe --version
+          .\build\Release\frame_sender.exe --self-test
+      - name: Package
+        run: cpack --config build\CPackConfig.cmake -C Release -G ZIP -B dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FrameSender-windows-x64
+          path: dist/*.zip
+          if-no-files-found: error
