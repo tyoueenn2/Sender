@@ -5,6 +5,7 @@
 #include <bcrypt.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
+#include <mswsock.h>
 #include <mstcpip.h>
 #include <ws2tcpip.h>
 #include <wrl/client.h>
