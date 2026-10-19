@@ -47,25 +47,31 @@ List available displays:
 .\build\Release\frame_sender.exe --list-outputs
 ```
 
-Send a fixed 320×320 center crop to a Receiver PC:
+Send a center crop matching Receiver's active model automatically:
 
 ```powershell
-.\build\Release\frame_sender.exe --host 192.168.1.10 --output 0 --size 320
+.\build\Release\frame_sender.exe --host 192.168.1.10 --output 0
 ```
 
-Let Receiver choose the crop from its YOLO model input size:
+FrameSender waits for Receiver to finish loading its model before sending pixels.
+Changing the model or input size in Receiver updates the crop while both programs
+keep running. In color-only mode it follows Receiver's **Capture size** setting.
+Pixels remain an exact, unscaled BGRA center crop.
+
+For a fixed 320×320 crop, or a Receiver build without resolution requests:
 
 ```powershell
-.\build\Release\frame_sender.exe --host 192.168.1.10 --output 0 --size 320 --sync-resolution
+.\build\Release\frame_sender.exe --host 192.168.1.10 --output 0 --no-sync-resolution --size 320
 ```
 
 Useful options:
 
 | Option | Meaning |
 |---|---|
-| `--size N` | Exact square center crop, 1–1024 pixels |
-| `--width N --height N` | Exact rectangular center crop |
-| `--sync-resolution` | Follow Receiver's session-bound UVN1 size request |
+| `--sync-resolution` | Follow Receiver's session-bound UVN1 size request; enabled by default |
+| `--no-sync-resolution` | Use manual dimensions; also supports older Receivers |
+| `--size N` | Manual square center crop, 1–1024 pixels; default 320 |
+| `--width N --height N` | Manual rectangular center crop |
 | `--fps N` | Maximum send rate; zero sends every new desktop present |
 | `--output N` | Display index reported by `--list-outputs` |
 | `--port N` | Receiver UDP frame port; default 5000 |
@@ -83,6 +89,8 @@ Receiver must allow inbound UDP on the selected frame port and configure **Sende
 - UDP datagrams stay at or below 1400 bytes to avoid IPv4 fragmentation with a normal 1500-byte MTU.
 - A full socket never blocks capture behind stale pixels. The partial frame is abandoned and a short drain interval allows a later fresh frame to complete.
 - `--sync-resolution` changes the exact crop dimensions; it never scales an image.
+- A requested crop larger than the selected display reports an error. Choose a
+  smaller Receiver input size or a larger display.
 
 Raw BGRA payload rates before protocol and Ethernet overhead:
 
@@ -101,11 +109,27 @@ FrameSender uses these existing Receiver protocols:
 - `UVH1`: sender ownership heartbeat every 50 ms.
 - `UVC1` / `UVS1`: monotonic clock synchronization.
 - `UVF1`: raw BGRA frame fragments.
-- `UVN1`: optional Receiver-requested center-crop dimensions.
+- `UVN1`: Receiver-requested center-crop dimensions, followed by default.
 
-Unknown control datagrams are ignored. `--sync-resolution` is opt-in, so FrameSender remains compatible with Receiver builds that predate UVN1.
+Receiver repeats UVN1 requests every 250 ms and immediately after the active input
+size changes. Requests are bound to the sender's current session and connected
+Receiver endpoint. Malformed requests, unsupported formats, and stale sessions
+are ignored. Unknown control datagrams are ignored.
+
+Both programs need builds with UVN1 support for automatic sizing. If the sender
+keeps waiting, start Receiver's UDP session and check its **Sender IPv4**, UDP port,
+and firewall rules. Use `--no-sync-resolution` with Receiver builds that predate
+UVN1. Manual senders continue to work with the updated Receiver.
 
 The complete byte layouts are documented in [docs/PROTOCOL.md](docs/PROTOCOL.md).
+
+Portable UVN1 tests can also run without Windows capture:
+
+```bash
+cmake -S . -B build/protocol-tests -DFRAME_SENDER_TESTS_ONLY=ON
+cmake --build build/protocol-tests
+ctest --test-dir build/protocol-tests --output-on-failure
+```
 
 ## Current validation boundary
 

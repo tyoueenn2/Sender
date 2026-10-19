@@ -9,6 +9,7 @@
 #include <mstcpip.h>
 #include <ws2tcpip.h>
 #include <wrl/client.h>
+#include "resolution.hpp"
 
 #include <algorithm>
 #include <array>
@@ -131,7 +132,7 @@ struct Options {
     unsigned output = 0;
     double fps = 0;
     int send_buffer_mib = 2;
-    bool sync_resolution = false;
+    bool sync_resolution = true;
     bool list_outputs = false;
     bool self_test = false;
 };
@@ -167,10 +168,11 @@ void usage() {
         << "FrameSender " FRAME_SENDER_VERSION
            " - low-latency, center-crop-only Windows frame sender\n\n"
         << "frame_sender --host RECEIVER_IPV4 [options]\n\n"
-        << "  --size PIXELS           square crop (default 320)\n"
-        << "  --width PIXELS          crop width, 1..1024\n"
-        << "  --height PIXELS         crop height, 1..1024\n"
-        << "  --sync-resolution       follow the Receiver model size\n"
+        << "  --sync-resolution       follow Receiver's capture size (default)\n"
+        << "  --no-sync-resolution    use a fixed crop; supports older Receivers\n"
+        << "  --size PIXELS           manual square crop (default 320)\n"
+        << "  --width PIXELS          manual crop width, 1..1024\n"
+        << "  --height PIXELS         manual crop height, 1..1024\n"
         << "  --output INDEX          desktop output from --list-outputs\n"
         << "  --fps FPS               cap sending; 0 sends every new present\n"
         << "  --port PORT             Receiver frame port (default 5000)\n"
@@ -209,6 +211,8 @@ Options parse_options(int argc, char** argv) {
             options.send_buffer_mib = int(integer(next(i, "--send-buffer-mib"), "send buffer", 16));
         else if (argument == "--sync-resolution")
             options.sync_resolution = true;
+        else if (argument == "--no-sync-resolution")
+            options.sync_resolution = false;
         else if (argument == "--list-outputs")
             options.list_outputs = true;
         else if (argument == "--self-test")
@@ -535,6 +539,14 @@ SendResult send_frame(SOCKET socket, const CapturedFrame& frame, uint64_t sessio
 }
 
 void self_test() {
+    char executable[] = "frame_sender";
+    char manual[] = "--no-sync-resolution";
+    char automatic[] = "--sync-resolution";
+    char* arguments[] = {executable, manual, automatic};
+    if (!parse_options(1, arguments).sync_resolution ||
+        parse_options(2, arguments).sync_resolution ||
+        !parse_options(3, arguments).sync_resolution)
+        throw std::runtime_error("Resolution sync option self-test failed");
     constexpr uint64_t session = 0x0102030405060708ull;
     CapturedFrame frame;
     frame.width = 320;
@@ -601,7 +613,7 @@ class ControlPlane {
                 const int64_t received = now_ns();
                 if (length == SOCKET_ERROR) {
                     const int error = WSAGetLastError();
-                    if (transient_socket_error(error))
+                    if (transient_socket_error(error) || error == WSAEMSGSIZE)
                         continue;
                     throw std::runtime_error("UDP control receive failed");
                 }
@@ -614,15 +626,12 @@ class ControlPlane {
                     put64(reply.data() + 24, uint64_t(received));
                     put64(reply.data() + 32, uint64_t(now_ns()));
                     send_control(socket_, reply.data(), reply.size());
-                } else if (accept_resolution_ && length == 24 &&
-                           !std::memcmp(packet.data(), "UVN1", 4) && packet[4] == 1 &&
-                           packet[5] == 2 && get16(packet.data() + 6) == 0 &&
-                           get64(packet.data() + 8) == session_ &&
-                           get32(packet.data() + 20) == 0) {
-                    const uint16_t width = get16(packet.data() + 16);
-                    const uint16_t height = get16(packet.data() + 18);
-                    if (width && height && width <= 1024 && height <= 1024)
-                        desired_.store(pack(width, height), std::memory_order_release);
+                } else if (accept_resolution_ && length > 0) {
+                    auto resolution = frame_sender::parse_resolution_request(
+                        std::span<const uint8_t>(packet.data(), size_t(length)), session_);
+                    if (resolution)
+                        desired_.store(pack(resolution->width, resolution->height),
+                                       std::memory_order_release);
                 }
             }
         } catch (const std::exception& error) {
@@ -635,7 +644,7 @@ class ControlPlane {
     ControlPlane(SOCKET socket, uint64_t session, uint16_t width, uint16_t height,
                  bool accept_resolution)
         : socket_(socket), session_(session), accept_resolution_(accept_resolution),
-          desired_(pack(width, height)), thread_([this] { run(); }) {}
+          desired_(accept_resolution ? 0 : pack(width, height)), thread_([this] { run(); }) {}
 
     ~ControlPlane() {
         stop();
@@ -698,17 +707,21 @@ int main(int argc, char** argv) {
         Network network(options.host, options.port, options.send_buffer_mib);
         const uint64_t session = random_session();
         auto capture = std::make_unique<DesktopCapture>(options.output);
-        uint16_t width = options.width, height = options.height;
-        if (!capture->fits(width, height))
+        uint16_t width = options.sync_resolution ? 0 : options.width;
+        uint16_t height = options.sync_resolution ? 0 : options.height;
+        if (!options.sync_resolution && !capture->fits(width, height))
             throw std::runtime_error("Initial crop is larger than the selected output");
         std::atomic<bool> stop{false};
         ConsoleHandlerGuard console(stop);
         ControlPlane control(network.socket, session, options.width, options.height,
                              options.sync_resolution);
-        std::cout << "Sending exact center crop " << width << 'x' << height << " BGRA to "
-                  << options.host << ':' << options.port
-                  << (options.sync_resolution ? " (resolution sync enabled)" : "") << "\n"
-                  << "Press Ctrl+C to stop.\n";
+        if (options.sync_resolution)
+            std::cout << "Waiting for Receiver's capture size at " << options.host << ':' << options.port
+                      << ". Start Receiver with this PC's Sender IPv4 configured.\n";
+        else
+            std::cout << "Sending fixed center crop " << width << 'x' << height << " BGRA to "
+                      << options.host << ':' << options.port << "\n";
+        std::cout << "Press Ctrl+C to stop.\n";
 
         CapturedFrame frame;
         uint32_t sequence = 0;
@@ -720,10 +733,20 @@ int main(int argc, char** argv) {
 
         while (!stop.load(std::memory_order_relaxed) && !control.stopped()) {
             auto [requested_width, requested_height] = control.desired();
-            if ((requested_width != width || requested_height != height) &&
-                capture->fits(requested_width, requested_height)) {
+            if (!requested_width || !requested_height) {
+                // Heartbeats and clock replies continue while the model loads. Do
+                // not send guessed dimensions before Receiver publishes its size.
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                continue;
+            }
+            if (requested_width != width || requested_height != height) {
+                if (!capture->fits(requested_width, requested_height))
+                    throw std::runtime_error("Receiver requested " + std::to_string(requested_width) +
+                                             "x" + std::to_string(requested_height) +
+                                             ", which is larger than the selected output");
                 width = requested_width;
                 height = requested_height;
+                next_send = backpressure_until = 0;
                 std::cout << "Receiver requested exact center crop " << width << 'x' << height << "\n";
             }
             try {
@@ -740,6 +763,10 @@ int main(int argc, char** argv) {
             }
             ++captured;
             const uint32_t frame_sequence = sequence++;
+            if (control.desired() != std::pair{width, height}) {
+                ++skipped;
+                continue; // The request changed while DXGI was acquiring this frame.
+            }
             const int64_t now = now_ns();
             if ((interval && now < next_send) || now < backpressure_until) {
                 ++skipped;

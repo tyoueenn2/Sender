@@ -51,9 +51,13 @@ FrameSender records `t1` immediately after receipt and `t2` immediately before r
 
 All timestamps use the same QueryPerformanceCounter-derived monotonic nanosecond clock as UVF1 capture timestamps.
 
-## Optional resolution request: UVN1
+## Receiver resolution request: UVN1
 
-Receiver may repeat this 24-byte request:
+Receiver sends this 24-byte request after a sender heartbeat and successful model
+initialization, whenever the active input size changes, and every 250 ms while the
+sender's heartbeat lease is fresh. It keeps requesting the previous size during a
+model replacement and after a failed replacement. Color-only mode uses Receiver's
+configured capture size.
 
 | Offset | Bytes | Field |
 |---:|---:|---|
@@ -66,4 +70,14 @@ Receiver may repeat this 24-byte request:
 | 18 | 2 | Requested crop height |
 | 20 | 4 | Reserved, zero |
 
-FrameSender applies UVN1 only when started with `--sync-resolution`, the session matches, dimensions are 1–1024, and the requested center crop fits the selected display. Otherwise it is ignored. Applying UVN1 changes the exact crop dimensions and never scales pixels.
+FrameSender follows UVN1 by default and waits for its first valid request before
+sending frames. It requires a matching nonzero session, version 1, BGRA32 format 2,
+zero reserved fields, and dimensions in 1–1024. Invalid requests are ignored. A
+valid crop larger than the selected display stops sending with a clear error.
+Applying UVN1 changes the exact crop dimensions between frames and never scales
+pixels. The following UVF1 frames carry the applied width, height, and format; no
+separate acknowledgement is needed. Periodic requests recover from UDP loss.
+
+`--no-sync-resolution` ignores UVN1 and uses the manual dimensions. Older senders
+may also ignore UVN1; Receiver continues to accept their valid RGB24/BGRA32 frames
+at the sender's chosen dimensions.
