@@ -5,6 +5,18 @@ on:
   pull_request:
 
 jobs:
+  protocol:
+    name: Portable resolution protocol tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure protocol tests without Windows capture
+        run: cmake -S . -B build/protocol-tests -DFRAME_SENDER_TESTS_ONLY=ON -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build/protocol-tests --parallel 2
+      - name: Test
+        run: ctest --test-dir build/protocol-tests --output-on-failure --no-tests=error
+
   build:
     runs-on: windows-2022
     steps:
@@ -12,11 +24,12 @@ jobs:
       - name: Configure
         run: cmake --preset windows-release
       - name: Build
-        run: cmake --build --preset windows-release --target frame_sender
+        run: cmake --build --preset windows-release
       - name: Smoke test
         run: |
           .\build\Release\frame_sender.exe --version
           .\build\Release\frame_sender.exe --self-test
+          ctest --test-dir build -C Release --output-on-failure --no-tests=error
       - name: Package
         run: cpack --config build\CPackConfig.cmake -C Release -G ZIP -B dist
       - uses: actions/upload-artifact@v4
