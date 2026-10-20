@@ -31,7 +31,7 @@ cmake --build --preset windows-release --target frame_sender
 
 The executable is written to `build\Release\frame_sender.exe`.
 
-The included GitHub Actions workflow performs the same Windows build, runs `--version` and the built-in `--self-test`, and publishes a ZIP artifact when this directory is placed in its own repository.
+The GitHub Actions workflow builds Windows Release and Debug, runs `--version`, the built-in `--self-test`, and the resolution/cursor protocol checks. Portable protocol checks also run on Linux in both configurations. Release builds upload a ZIP artifact, and each job retains diagnostics.
 
 To create a standalone ZIP containing the executable and README:
 
@@ -134,3 +134,12 @@ ctest --test-dir build/protocol-tests --output-on-failure
 ## Current validation boundary
 
 The wire layout has been checked against Receiver's protocol implementation. This workspace does not currently expose an MSVC compiler or Windows SDK, so the executable still requires its first Release build and hardware benchmark on the deployment PCs. Verify exact crop pixels, display-mode recovery, sustained throughput, packet loss, and capture-to-reassembly latency before relying on production measurements.
+
+## Receiver calibration feedback
+
+Updated Receiver builds can request `UVP1`/`UVG1` cursor feedback for automatic
+desktop calibration and verification of move/click/return actions. FrameSender
+reports cursor position, visibility, physical display/crop geometry and an
+associated frame sequence. It does not move the mouse. Feedback continues on a
+static desktop and before the first crop request. No additional command-line
+option is required. See [the protocol](docs/PROTOCOL.md).

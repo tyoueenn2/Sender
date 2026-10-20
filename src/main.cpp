@@ -10,6 +10,8 @@
 #include <ws2tcpip.h>
 #include <wrl/client.h>
 #include "resolution.hpp"
+#include "cursor.hpp"
+#include <mutex>
 
 #include <algorithm>
 #include <array>
@@ -164,23 +166,22 @@ double real(const std::string& text, const char* name, double maximum) {
 }
 
 void usage() {
-    std::cout
-        << "FrameSender " FRAME_SENDER_VERSION
-           " - low-latency, center-crop-only Windows frame sender\n\n"
-        << "frame_sender --host RECEIVER_IPV4 [options]\n\n"
-        << "  --sync-resolution       follow Receiver's capture size (default)\n"
-        << "  --no-sync-resolution    use a fixed crop; supports older Receivers\n"
-        << "  --size PIXELS           manual square crop (default 320)\n"
-        << "  --width PIXELS          manual crop width, 1..1024\n"
-        << "  --height PIXELS         manual crop height, 1..1024\n"
-        << "  --output INDEX          desktop output from --list-outputs\n"
-        << "  --fps FPS               cap sending; 0 sends every new present\n"
-        << "  --port PORT             Receiver frame port (default 5000)\n"
-        << "  --send-buffer-mib MIB   UDP queue, 1..16 (default 2)\n"
-        << "  --list-outputs          list displays and exit\n"
-        << "  --self-test             verify wire encoding and exit\n"
-        << "  --version               show the software version\n"
-        << "  --help                  show this text\n";
+    std::cout << "FrameSender " FRAME_SENDER_VERSION
+                 " - low-latency, center-crop-only Windows frame sender\n\n"
+              << "frame_sender --host RECEIVER_IPV4 [options]\n\n"
+              << "  --sync-resolution       follow Receiver's capture size (default)\n"
+              << "  --no-sync-resolution    use a fixed crop; supports older Receivers\n"
+              << "  --size PIXELS           manual square crop (default 320)\n"
+              << "  --width PIXELS          manual crop width, 1..1024\n"
+              << "  --height PIXELS         manual crop height, 1..1024\n"
+              << "  --output INDEX          desktop output from --list-outputs\n"
+              << "  --fps FPS               cap sending; 0 sends every new present\n"
+              << "  --port PORT             Receiver frame port (default 5000)\n"
+              << "  --send-buffer-mib MIB   UDP queue, 1..16 (default 2)\n"
+              << "  --list-outputs          list displays and exit\n"
+              << "  --self-test             verify wire encoding and exit\n"
+              << "  --version               show the software version\n"
+              << "  --help                  show this text\n";
 }
 
 Options parse_options(int argc, char** argv) {
@@ -220,8 +221,7 @@ Options parse_options(int argc, char** argv) {
         else if (argument == "--version") {
             std::cout << "FrameSender " FRAME_SENDER_VERSION "\n";
             std::exit(0);
-        }
-        else if (argument == "--help" || argument == "-h") {
+        } else if (argument == "--help" || argument == "-h") {
             usage();
             std::exit(0);
         } else
@@ -294,6 +294,8 @@ class DesktopCapture {
     uint16_t staging_width_ = 0;
     uint16_t staging_height_ = 0;
     bool protected_content_reported_ = false;
+    RECT desktop_bounds_{};
+    uint64_t display_id_ = 1469598103934665603ull;
 
     void make_staging(uint16_t width, uint16_t height) {
         D3D11_TEXTURE2D_DESC description{};
@@ -318,6 +320,11 @@ class DesktopCapture {
         if (output_index >= available.size())
             throw std::runtime_error("Output index is unavailable; run --list-outputs");
         const auto& choice = available[output_index];
+        desktop_bounds_ = choice.description.DesktopCoordinates;
+        for (const auto ch : std::wstring(choice.description.DeviceName)) {
+            display_id_ ^= uint16_t(ch);
+            display_id_ *= 1099511628211ull;
+        }
         constexpr D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
         D3D_FEATURE_LEVEL selected{};
         checked(D3D11CreateDevice(choice.adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
@@ -338,6 +345,17 @@ class DesktopCapture {
         std::cout << "Capturing output " << output_index << " (" << utf8(choice.description.DeviceName)
                   << ", " << duplication_description_.ModeDesc.Width << 'x'
                   << duplication_description_.ModeDesc.Height << ")\n";
+    }
+
+    cursor_protocol::Sample geometry() const {
+        cursor_protocol::Sample s;
+        s.left = desktop_bounds_.left;
+        s.top = desktop_bounds_.top;
+        s.width = desktop_bounds_.right - desktop_bounds_.left;
+        s.height = desktop_bounds_.bottom - desktop_bounds_.top;
+        s.display = display_id_;
+        s.generation = 1;
+        return s;
     }
 
     bool fits(uint16_t width, uint16_t height) const {
@@ -362,7 +380,8 @@ class DesktopCapture {
         } release{duplication_.Get()};
 
         if (information.ProtectedContentMaskedOut && !protected_content_reported_) {
-            std::cerr << "Windows masked protected content in the duplicated desktop; it will remain masked.\n";
+            std::cerr
+                << "Windows masked protected content in the duplicated desktop; it will remain masked.\n";
             protected_content_reported_ = true;
         }
 
@@ -399,8 +418,7 @@ class DesktopCapture {
         const size_t row_bytes = size_t(width) * 4;
         for (uint16_t y = 0; y < height; ++y)
             std::memcpy(frame.pixels.data() + size_t(y) * row_bytes,
-                        static_cast<const uint8_t*>(mapped.pData) + size_t(y) * mapped.RowPitch,
-                        row_bytes);
+                        static_cast<const uint8_t*>(mapped.pData) + size_t(y) * mapped.RowPitch, row_bytes);
         return true;
     }
 };
@@ -443,8 +461,8 @@ class Network {
                    sizeof(send_buffer));
         BOOL reset_on_unreachable = FALSE;
         DWORD returned = 0;
-        WSAIoctl(socket, SIO_UDP_CONNRESET, &reset_on_unreachable, sizeof(reset_on_unreachable),
-                 nullptr, 0, &returned, nullptr, nullptr);
+        WSAIoctl(socket, SIO_UDP_CONNRESET, &reset_on_unreachable, sizeof(reset_on_unreachable), nullptr, 0,
+                 &returned, nullptr, nullptr);
         if (connect(socket, addresses->ai_addr, int(addresses->ai_addrlen)) == SOCKET_ERROR) {
             closesocket(socket);
             socket = INVALID_SOCKET;
@@ -487,9 +505,8 @@ struct SendResult {
     uint64_t bytes = 0;
 };
 
-std::array<uint8_t, frame_header_size> encode_frame_header(const CapturedFrame& frame,
-                                                           uint64_t session, uint32_t sequence,
-                                                           uint16_t index, uint16_t count,
+std::array<uint8_t, frame_header_size> encode_frame_header(const CapturedFrame& frame, uint64_t session,
+                                                           uint32_t sequence, uint16_t index, uint16_t count,
                                                            uint32_t offset) {
     std::array<uint8_t, frame_header_size> header{};
     std::memcpy(header.data(), "UVF1", 4);
@@ -509,8 +526,7 @@ std::array<uint8_t, frame_header_size> encode_frame_header(const CapturedFrame& 
     return header;
 }
 
-SendResult send_frame(SOCKET socket, const CapturedFrame& frame, uint64_t session,
-                      uint32_t sequence) {
+SendResult send_frame(SOCKET socket, const CapturedFrame& frame, uint64_t session, uint32_t sequence) {
     const uint32_t bytes = uint32_t(frame.pixels.size());
     const uint16_t count = uint16_t((bytes + frame_stride - 1) / frame_stride);
     SendResult result;
@@ -518,16 +534,15 @@ SendResult send_frame(SOCKET socket, const CapturedFrame& frame, uint64_t sessio
         const uint32_t offset = uint32_t(index) * frame_stride;
         const uint32_t payload = std::min<uint32_t>(frame_stride, bytes - offset);
         auto header = encode_frame_header(frame, session, sequence, index, count, offset);
-        WSABUF buffers[2] = {{ULONG(header.size()), reinterpret_cast<char*>(header.data())},
-                             {ULONG(payload), reinterpret_cast<char*>(
-                                                  const_cast<uint8_t*>(frame.pixels.data() + offset))}};
+        WSABUF buffers[2] = {
+            {ULONG(header.size()), reinterpret_cast<char*>(header.data())},
+            {ULONG(payload), reinterpret_cast<char*>(const_cast<uint8_t*>(frame.pixels.data() + offset))}};
         DWORD sent = 0;
         if (WSASend(socket, buffers, 2, &sent, 0, nullptr, nullptr) == SOCKET_ERROR) {
             const int error = WSAGetLastError();
             if (transient_socket_error(error))
                 return result; // Abandon this frame; never wait behind stale pixels.
-            throw std::runtime_error("UDP frame send failed with Winsock error " +
-                                     std::to_string(error));
+            throw std::runtime_error("UDP frame send failed with Winsock error " + std::to_string(error));
         }
         if (sent != frame_header_size + payload)
             return result;
@@ -543,8 +558,7 @@ void self_test() {
     char manual[] = "--no-sync-resolution";
     char automatic[] = "--sync-resolution";
     char* arguments[] = {executable, manual, automatic};
-    if (!parse_options(1, arguments).sync_resolution ||
-        parse_options(2, arguments).sync_resolution ||
+    if (!parse_options(1, arguments).sync_resolution || parse_options(2, arguments).sync_resolution ||
         !parse_options(3, arguments).sync_resolution)
         throw std::runtime_error("Resolution sync option self-test failed");
     constexpr uint64_t session = 0x0102030405060708ull;
@@ -556,19 +570,15 @@ void self_test() {
     const uint16_t count = uint16_t((frame.pixels.size() + frame_stride - 1) / frame_stride);
     auto header = encode_frame_header(frame, session, 0x89abcdefu, uint16_t(count - 1), count,
                                       uint32_t(count - 1) * frame_stride);
-    const bool valid = !std::memcmp(header.data(), "UVF1", 4) && header[4] == 1 &&
-                       header[5] == 2 && get16(header.data() + 6) == frame_header_size &&
-                       get64(header.data() + 8) == session &&
-                       get32(header.data() + 16) == 0x89abcdefu &&
-                       get64(header.data() + 20) == uint64_t(frame.capture_ns) &&
-                       get16(header.data() + 28) == frame.width &&
-                       get16(header.data() + 30) == frame.height &&
-                       get32(header.data() + 32) == frame.pixels.size() &&
-                       get16(header.data() + 36) == count - 1 &&
-                       get16(header.data() + 38) == count &&
-                       get32(header.data() + 40) == uint32_t(count - 1) * frame_stride &&
-                       get16(header.data() + 44) == frame_stride &&
-                       get16(header.data() + 46) == 0;
+    const bool valid =
+        !std::memcmp(header.data(), "UVF1", 4) && header[4] == 1 && header[5] == 2 &&
+        get16(header.data() + 6) == frame_header_size && get64(header.data() + 8) == session &&
+        get32(header.data() + 16) == 0x89abcdefu && get64(header.data() + 20) == uint64_t(frame.capture_ns) &&
+        get16(header.data() + 28) == frame.width && get16(header.data() + 30) == frame.height &&
+        get32(header.data() + 32) == frame.pixels.size() && get16(header.data() + 36) == count - 1 &&
+        get16(header.data() + 38) == count &&
+        get32(header.data() + 40) == uint32_t(count - 1) * frame_stride &&
+        get16(header.data() + 44) == frame_stride && get16(header.data() + 46) == 0;
     if (!valid)
         throw std::runtime_error("UVF1 wire self-test failed");
     std::cout << "FrameSender wire self-test passed (" << count << " fragments for 320x160 BGRA).\n";
@@ -580,6 +590,9 @@ class ControlPlane {
     bool accept_resolution_;
     std::atomic<uint32_t> desired_;
     std::atomic<bool> stop_{false};
+    std::mutex cursor_mutex_;
+    cursor_protocol::Sample cursor_;
+    uint32_t cursor_sequence_ = 0;
     std::thread thread_;
 
     static uint32_t pack(uint16_t width, uint16_t height) {
@@ -608,8 +621,8 @@ class ControlPlane {
                 if (!ready)
                     continue;
                 std::array<uint8_t, 256> packet{};
-                const int length = recv(socket_, reinterpret_cast<char*>(packet.data()),
-                                        int(packet.size()), 0);
+                const int length =
+                    recv(socket_, reinterpret_cast<char*>(packet.data()), int(packet.size()), 0);
                 const int64_t received = now_ns();
                 if (length == SOCKET_ERROR) {
                     const int error = WSAGetLastError();
@@ -617,8 +630,8 @@ class ControlPlane {
                         continue;
                     throw std::runtime_error("UDP control receive failed");
                 }
-                if (length == 24 && !std::memcmp(packet.data(), "UVC1", 4) &&
-                    get32(packet.data() + 4) == 0 && get64(packet.data() + 8) == session_) {
+                if (length == 24 && !std::memcmp(packet.data(), "UVC1", 4) && get32(packet.data() + 4) == 0 &&
+                    get64(packet.data() + 8) == session_) {
                     std::array<uint8_t, 40> reply{};
                     std::memcpy(reply.data(), "UVS1", 4);
                     put64(reply.data() + 8, session_);
@@ -626,6 +639,31 @@ class ControlPlane {
                     put64(reply.data() + 24, uint64_t(received));
                     put64(reply.data() + 32, uint64_t(now_ns()));
                     send_control(socket_, reply.data(), reply.size());
+                } else if (length == 24 && !std::memcmp(packet.data(), "UVP1", 4)) {
+                    uint64_t token = 0;
+                    if (cursor_protocol::parse_request(packet.data(), size_t(length), session_, token)) {
+                        cursor_protocol::Sample sample;
+                        {
+                            std::lock_guard<std::mutex> lock(cursor_mutex_);
+                            sample = cursor_;
+                        }
+                        sample.session = session_;
+                        sample.token = token;
+                        sample.sequence = ++cursor_sequence_;
+                        POINT position{};
+                        CURSORINFO info{};
+                        info.cbSize = sizeof(info);
+                        if (GetCursorPos(&position)) {
+                            sample.flags |= 1;
+                            sample.x = position.x;
+                            sample.y = position.y;
+                        }
+                        if (GetCursorInfo(&info) && (info.flags & CURSOR_SHOWING))
+                            sample.flags |= 2;
+                        sample.sample_ns = uint64_t(now_ns());
+                        auto response = cursor_protocol::packet(sample);
+                        send_control(socket_, response.data(), response.size());
+                    }
                 } else if (accept_resolution_ && length > 0) {
                     auto resolution = frame_sender::parse_resolution_request(
                         std::span<const uint8_t>(packet.data(), size_t(length)), session_);
@@ -641,10 +679,11 @@ class ControlPlane {
     }
 
   public:
-    ControlPlane(SOCKET socket, uint64_t session, uint16_t width, uint16_t height,
-                 bool accept_resolution)
+    ControlPlane(SOCKET socket, uint64_t session, uint16_t width, uint16_t height, bool accept_resolution,
+                 cursor_protocol::Sample geometry)
         : socket_(socket), session_(session), accept_resolution_(accept_resolution),
-          desired_(accept_resolution ? 0 : pack(width, height)), thread_([this] { run(); }) {}
+          desired_(accept_resolution ? 0 : pack(width, height)), cursor_(geometry),
+          thread_([this] { run(); }) {}
 
     ~ControlPlane() {
         stop();
@@ -654,6 +693,26 @@ class ControlPlane {
         stop_.store(true, std::memory_order_relaxed);
         if (thread_.joinable())
             thread_.join();
+    }
+
+    void publish(cursor_protocol::Sample sample, uint16_t width, uint16_t height, uint32_t sequence,
+                 int64_t stamp) {
+        std::lock_guard<std::mutex> lock(cursor_mutex_);
+        const bool changed = cursor_.display != sample.display || cursor_.left != sample.left ||
+                             cursor_.top != sample.top || cursor_.width != sample.width ||
+                             cursor_.height != sample.height || cursor_.crop_width != width ||
+                             cursor_.crop_height != height;
+        sample.generation = cursor_.generation + (changed ? 1 : 0);
+        if (!sample.generation)
+            sample.generation = 1;
+        sample.crop_width = width;
+        sample.crop_height = height;
+        sample.crop_left = sample.left + (sample.width - width) / 2;
+        sample.crop_top = sample.top + (sample.height - height) / 2;
+        sample.flags = 4;
+        sample.frame_sequence = sequence;
+        sample.frame_ns = uint64_t(stamp);
+        cursor_ = sample;
     }
 
     bool stopped() const {
@@ -694,6 +753,7 @@ class ConsoleHandlerGuard {
 } // namespace
 
 int main(int argc, char** argv) {
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     try {
         const Options options = parse_options(argc, argv);
         if (options.list_outputs) {
@@ -713,20 +773,19 @@ int main(int argc, char** argv) {
             throw std::runtime_error("Initial crop is larger than the selected output");
         std::atomic<bool> stop{false};
         ConsoleHandlerGuard console(stop);
-        ControlPlane control(network.socket, session, options.width, options.height,
-                             options.sync_resolution);
+        ControlPlane control(network.socket, session, options.width, options.height, options.sync_resolution,
+                             capture->geometry());
         if (options.sync_resolution)
             std::cout << "Waiting for Receiver's capture size at " << options.host << ':' << options.port
                       << ". Start Receiver with this PC's Sender IPv4 configured.\n";
         else
-            std::cout << "Sending fixed center crop " << width << 'x' << height << " BGRA to "
-                      << options.host << ':' << options.port << "\n";
+            std::cout << "Sending fixed center crop " << width << 'x' << height << " BGRA to " << options.host
+                      << ':' << options.port << "\n";
         std::cout << "Press Ctrl+C to stop.\n";
 
         CapturedFrame frame;
         uint32_t sequence = 0;
-        uint64_t captured = 0, sent_frames = 0, dropped = 0, skipped = 0, datagrams = 0,
-                 wire_bytes = 0;
+        uint64_t captured = 0, sent_frames = 0, dropped = 0, skipped = 0, datagrams = 0, wire_bytes = 0;
         int64_t report_at = now_ns() + 1'000'000'000;
         int64_t next_send = 0, backpressure_until = 0;
         const int64_t interval = options.fps > 0 ? int64_t(1e9 / options.fps) : 0;
@@ -741,8 +800,8 @@ int main(int argc, char** argv) {
             }
             if (requested_width != width || requested_height != height) {
                 if (!capture->fits(requested_width, requested_height))
-                    throw std::runtime_error("Receiver requested " + std::to_string(requested_width) +
-                                             "x" + std::to_string(requested_height) +
+                    throw std::runtime_error("Receiver requested " + std::to_string(requested_width) + "x" +
+                                             std::to_string(requested_height) +
                                              ", which is larger than the selected output");
                 width = requested_width;
                 height = requested_height;
@@ -776,15 +835,15 @@ int main(int argc, char** argv) {
             const SendResult result = send_frame(network.socket, frame, session, frame_sequence);
             datagrams += result.datagrams;
             wire_bytes += result.bytes;
-            if (result.complete)
+            if (result.complete) {
                 ++sent_frames;
-            else {
+                control.publish(capture->geometry(), width, height, frame_sequence, frame.capture_ns);
+            } else {
                 ++dropped;
                 // Let already-queued fragments drain before attempting another complete frame.
                 // One bit/ns is a conservative 1 Gbit/s recovery estimate; faster links pay this
                 // cost only after actual backpressure.
-                const int64_t recovery =
-                    std::max<int64_t>(1'000'000, int64_t(frame.pixels.size() * 8));
+                const int64_t recovery = std::max<int64_t>(1'000'000, int64_t(frame.pixels.size() * 8));
                 backpressure_until = now + recovery;
             }
 
@@ -793,8 +852,8 @@ int main(int argc, char** argv) {
                 std::cout << "capture " << (captured - previous_captured) << " fps, sent "
                           << (sent_frames - previous_sent) << " fps, " << skipped << " paced/skipped, "
                           << dropped << " backpressure drops, " << std::fixed << std::setprecision(1)
-                          << double(wire_bytes - previous_bytes) * 8 / 1e6 << " Mbit/s, "
-                          << width << 'x' << height << '\n';
+                          << double(wire_bytes - previous_bytes) * 8 / 1e6 << " Mbit/s, " << width << 'x'
+                          << height << '\n';
                 previous_captured = captured;
                 previous_sent = sent_frames;
                 previous_bytes = wire_bytes;
@@ -803,8 +862,8 @@ int main(int argc, char** argv) {
         }
         stop.store(true, std::memory_order_relaxed);
         control.stop();
-        std::cout << "Stopped. Captured " << captured << ", sent " << sent_frames << ", dropped "
-                  << dropped << ", paced/skipped " << skipped << ", datagrams " << datagrams << ".\n";
+        std::cout << "Stopped. Captured " << captured << ", sent " << sent_frames << ", dropped " << dropped
+                  << ", paced/skipped " << skipped << ", datagrams " << datagrams << ".\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "frame_sender: " << error.what() << '\n';

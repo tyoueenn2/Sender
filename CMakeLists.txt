@@ -25,7 +25,8 @@ target_compile_definitions(frame_sender PRIVATE FRAME_SENDER_VERSION=\"${PROJECT
 target_compile_options(frame_sender PRIVATE
   $<$<CXX_COMPILER_ID:MSVC>:/W4>
   $<$<CXX_COMPILER_ID:MSVC>:/permissive->)
-target_link_libraries(frame_sender PRIVATE d3d11 dxgi ws2_32 bcrypt)
+target_link_libraries(frame_sender PRIVATE d3d11 dxgi ws2_32 bcrypt user32)
+target_compile_definitions(frame_sender PRIVATE _WIN32_WINNT=0x0A00)
 
 install(TARGETS frame_sender RUNTIME DESTINATION .)
 install(FILES README.md DESTINATION .)

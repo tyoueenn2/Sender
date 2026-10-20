@@ -81,3 +81,41 @@ separate acknowledgement is needed. Periodic requests recover from UDP loss.
 `--no-sync-resolution` ignores UVN1 and uses the manual dimensions. Older senders
 may also ignore UVN1; Receiver continues to accept their valid RGB24/BGRA32 frames
 at the sender's chosen dimensions.
+
+## Cursor feedback: UVP1 and UVG1
+
+Receiver may request cursor feedback using `UVP1 | version:u8=1 | reserved:3=0 |
+sender_session:u64 | token:u64` (24 bytes). Session and token must be nonzero.
+FrameSender replies on its connected control socket independently of desktop
+presents or crop/model readiness. It samples documented Windows cursor APIs in
+physical desktop pixels with per-monitor DPI awareness.
+
+`UVG1` is 112 bytes, in network byte order:
+
+| Offset | Bytes | Field |
+| --- | --- | --- |
+| 0 | 4 | ASCII `UVG1` |
+| 4 | 1 | Version 1 |
+| 5 | 1 | Flags: valid cursor = 1, visible = 2, associated frame available = 4 |
+| 6 | 2 | Reserved, zero |
+| 8 | 8 | Sender session |
+| 16 | 8 | Echoed request token |
+| 24 | 8 | Cursor sample time, Sender monotonic nanoseconds |
+| 32 | 4 | Cursor sample sequence modulo 2^32 |
+| 36 | 4 | Nonzero display/crop geometry generation |
+| 40 | 8 | Signed cursor X and Y, two i32 values |
+| 48 | 16 | Output left, top, width, height, four i32 values |
+| 64 | 16 | Crop left, top, width, height, four i32 values |
+| 80 | 4 | Associated fully submitted UVF1 frame sequence |
+| 84 | 4 | Reserved, zero |
+| 88 | 8 | Associated frame capture timestamp |
+| 96 | 8 | Display identity fingerprint |
+| 104 | 8 | Reserved, zero |
+
+Crop origin uses physical virtual-desktop coordinates and belongs to the exact
+associated frame. Negative display origins are valid. The frame flag is clear
+until a frame has been submitted completely; cursor position can still be valid.
+A geometry change advances the generation. Receiver checks the owned source,
+Sender session, echoed recently issued token, sequence and freshness before using
+feedback. Older Senders ignore UVP1; view calibration and manual view verification remain available.
+Cursor feedback is used for geometric measurement, not physical-input telemetry.
