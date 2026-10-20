@@ -3,37 +3,77 @@ name: Windows build
 on:
   push:
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sender-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   protocol:
-    name: Portable resolution protocol tests
+    name: Resolution and cursor protocol / ${{ matrix.configuration }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        configuration: [Release, Debug]
     steps:
       - uses: actions/checkout@v4
       - name: Configure protocol tests without Windows capture
-        run: cmake -S . -B build/protocol-tests -DFRAME_SENDER_TESTS_ONLY=ON -DCMAKE_BUILD_TYPE=Release
-      - name: Build
+        run: cmake -S . -B build/protocol-tests -DFRAME_SENDER_TESTS_ONLY=ON -DCMAKE_BUILD_TYPE=${{ matrix.configuration }}
+      - name: Build resolution and cursor geometry codecs
         run: cmake --build build/protocol-tests --parallel 2
-      - name: Test
-        run: ctest --test-dir build/protocol-tests --output-on-failure --no-tests=error
+      - name: Verify tokens, signed coordinates, bounds and malformed packets
+        run: ctest --test-dir build/protocol-tests --output-on-failure --no-tests=error --output-junit protocol.xml
+      - name: Keep protocol diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sender-protocol-${{ matrix.configuration }}
+          path: |
+            build/protocol-tests/*.xml
+            build/protocol-tests/Testing/Temporary/
+          if-no-files-found: warn
 
   build:
+    name: Windows x64 / ${{ matrix.configuration }}
     runs-on: windows-2022
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        configuration: [Release, Debug]
     steps:
       - uses: actions/checkout@v4
-      - name: Configure
+      - name: Configure Windows SDK build
         run: cmake --preset windows-release
-      - name: Build
-        run: cmake --build --preset windows-release
-      - name: Smoke test
+      - name: Build capture and cursor feedback
+        run: cmake --build build --config ${{ matrix.configuration }} --parallel 2
+      - name: Smoke test and cursor protocol regression checks
         run: |
-          .\build\Release\frame_sender.exe --version
-          .\build\Release\frame_sender.exe --self-test
-          ctest --test-dir build -C Release --output-on-failure --no-tests=error
-      - name: Package
+          .\build\${{ matrix.configuration }}\frame_sender.exe --version
+          .\build\${{ matrix.configuration }}\frame_sender.exe --self-test
+          ctest --test-dir build -C ${{ matrix.configuration }} --output-on-failure --no-tests=error --output-junit windows.xml
+      - name: Package Release build
+        if: matrix.configuration == 'Release'
         run: cpack --config build\CPackConfig.cmake -C Release -G ZIP -B dist
       - uses: actions/upload-artifact@v4
+        if: matrix.configuration == 'Release'
         with:
           name: FrameSender-windows-x64
           path: dist/*.zip
           if-no-files-found: error
+      - name: Keep Windows build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sender-windows-${{ matrix.configuration }}
+          path: |
+            build/*.xml
+            build/Testing/Temporary/
+            build/CMakeFiles/CMakeConfigureLog.yaml
+          if-no-files-found: warn
