@@ -9,6 +9,14 @@
 #include <mstcpip.h>
 #include <ws2tcpip.h>
 #include <wrl/client.h>
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Graphics.h>
+#include <winrt/Windows.Graphics.Capture.h>
+#include <winrt/Windows.Graphics.DirectX.h>
+#include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
+#include <windows.graphics.capture.interop.h>
+#include <windows.graphics.directx.direct3d11.interop.h>
+#include "capture_options.hpp"
 #include "resolution.hpp"
 #include "cursor.hpp"
 #include <mutex>
@@ -132,10 +140,12 @@ struct Options {
     uint16_t width = 320;
     uint16_t height = 320;
     unsigned output = 0;
+    frame_sender::CaptureMethod capture_method = frame_sender::CaptureMethod::dxgi;
     double fps = 0;
     int send_buffer_mib = 2;
     bool sync_resolution = true;
     bool list_outputs = false;
+    bool list_capture_methods = false;
     bool self_test = false;
 };
 
@@ -175,13 +185,17 @@ void usage() {
               << "  --width PIXELS          manual crop width, 1..1024\n"
               << "  --height PIXELS         manual crop height, 1..1024\n"
               << "  --output INDEX          desktop output from --list-outputs\n"
-              << "  --fps FPS               cap sending; 0 sends every new present\n"
+              << "  --capture METHOD        dxgi (default), wgc, or gdi\n"
+              << "  --list-capture-methods  describe capture methods and exit\n"
+              << "  --fps FPS               send cap; 0 = new frames (GDI polls at 60)\n"
               << "  --port PORT             Receiver frame port (default 5000)\n"
               << "  --send-buffer-mib MIB   UDP queue, 1..16 (default 2)\n"
               << "  --list-outputs          list displays and exit\n"
               << "  --self-test             verify wire encoding and exit\n"
               << "  --version               show the software version\n"
-              << "  --help                  show this text\n";
+              << "  --help                  show this text\n\n";
+    for (const auto& info : frame_sender::capture_methods)
+        std::cout << "  " << info.name << ": " << info.description << '\n';
 }
 
 Options parse_options(int argc, char** argv) {
@@ -206,7 +220,13 @@ Options parse_options(int argc, char** argv) {
             options.height = uint16_t(integer(next(i, "--height"), "height", 1024));
         else if (argument == "--output")
             options.output = integer(next(i, "--output"), "output", 1024);
-        else if (argument == "--fps")
+        else if (argument == "--capture") {
+            const auto name = next(i, "--capture");
+            const auto method = frame_sender::parse_capture_method(name);
+            if (!method)
+                throw std::runtime_error("Unknown capture method: " + name + "; choose dxgi, wgc, or gdi");
+            options.capture_method = *method;
+        } else if (argument == "--fps")
             options.fps = real(next(i, "--fps"), "fps", 1000);
         else if (argument == "--send-buffer-mib")
             options.send_buffer_mib = int(integer(next(i, "--send-buffer-mib"), "send buffer", 16));
@@ -216,6 +236,8 @@ Options parse_options(int argc, char** argv) {
             options.sync_resolution = false;
         else if (argument == "--list-outputs")
             options.list_outputs = true;
+        else if (argument == "--list-capture-methods")
+            options.list_capture_methods = true;
         else if (argument == "--self-test")
             options.self_test = true;
         else if (argument == "--version") {
@@ -285,17 +307,77 @@ struct CapturedFrame {
     std::vector<uint8_t> pixels;
 };
 
-class DesktopCapture {
-    ComPtr<ID3D11Device> device_;
-    ComPtr<ID3D11DeviceContext> context_;
-    ComPtr<IDXGIOutputDuplication> duplication_;
-    ComPtr<ID3D11Texture2D> staging_;
-    DXGI_OUTDUPL_DESC duplication_description_{};
-    uint16_t staging_width_ = 0;
-    uint16_t staging_height_ = 0;
-    bool protected_content_reported_ = false;
+class Capture {
+  protected:
+    OutputChoice choice_;
     RECT desktop_bounds_{};
     uint64_t display_id_ = 1469598103934665603ull;
+
+    explicit Capture(unsigned output_index) {
+        auto available = outputs();
+        if (output_index >= available.size())
+            throw std::runtime_error("Output index is unavailable; run --list-outputs");
+        choice_ = std::move(available[output_index]);
+        if (!choice_.description.AttachedToDesktop)
+            throw std::runtime_error("Selected output is not attached to the desktop");
+        desktop_bounds_ = choice_.description.DesktopCoordinates;
+        for (const auto ch : std::wstring(choice_.description.DeviceName)) {
+            display_id_ ^= uint16_t(ch);
+            display_id_ *= 1099511628211ull;
+        }
+        std::cout << "Capturing output " << output_index << " (" << utf8(choice_.description.DeviceName)
+                  << ", " << desktop_bounds_.right - desktop_bounds_.left << 'x'
+                  << desktop_bounds_.bottom - desktop_bounds_.top << ")\n";
+    }
+
+    void check_monitor() const {
+        MONITORINFO info{};
+        info.cbSize = sizeof(info);
+        if (!GetMonitorInfoW(choice_.description.Monitor, &info) ||
+            !EqualRect(&info.rcMonitor, &desktop_bounds_))
+            throw HrError(DXGI_ERROR_ACCESS_LOST, "Selected display geometry changed");
+    }
+
+  public:
+    virtual ~Capture() = default;
+    Capture(const Capture&) = delete;
+    Capture& operator=(const Capture&) = delete;
+
+    cursor_protocol::Sample geometry() const {
+        cursor_protocol::Sample s;
+        s.left = desktop_bounds_.left;
+        s.top = desktop_bounds_.top;
+        s.width = desktop_bounds_.right - desktop_bounds_.left;
+        s.height = desktop_bounds_.bottom - desktop_bounds_.top;
+        s.display = display_id_;
+        s.generation = 1;
+        return s;
+    }
+
+    bool fits(uint16_t width, uint16_t height) const {
+        const auto s = geometry();
+        return frame_sender::center_crop(s.width, s.height, width, height).has_value();
+    }
+
+    virtual bool next(CapturedFrame& frame, uint16_t width, uint16_t height) = 0;
+};
+
+class GpuCapture : public Capture {
+  protected:
+    ComPtr<ID3D11Device> device_;
+    ComPtr<ID3D11DeviceContext> context_;
+    ComPtr<ID3D11Texture2D> staging_;
+    uint16_t staging_width_ = 0;
+    uint16_t staging_height_ = 0;
+
+    explicit GpuCapture(unsigned output_index) : Capture(output_index) {
+        constexpr D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+        D3D_FEATURE_LEVEL selected{};
+        checked(D3D11CreateDevice(choice_.adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+                                  D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels, UINT(std::size(levels)),
+                                  D3D11_SDK_VERSION, &device_, &selected, &context_),
+                "D3D11CreateDevice");
+    }
 
     void make_staging(uint16_t width, uint16_t height) {
         D3D11_TEXTURE2D_DESC description{};
@@ -314,61 +396,63 @@ class DesktopCapture {
         staging_height_ = height;
     }
 
+    bool read_crop(ID3D11Texture2D* desktop, CapturedFrame& frame, uint16_t width,
+                   uint16_t height, int64_t capture_ns) {
+        D3D11_TEXTURE2D_DESC source{};
+        desktop->GetDesc(&source);
+        const auto crop = frame_sender::center_crop(source.Width, source.Height, width, height);
+        if (source.Format != DXGI_FORMAT_B8G8R8A8_UNORM || !crop)
+            throw std::runtime_error("Desktop surface changed to an unsupported shape or format");
+        if (!staging_ || width != staging_width_ || height != staging_height_)
+            make_staging(width, height);
+
+        const D3D11_BOX box{crop->left, crop->top, 0, crop->left + width, crop->top + height, 1};
+        context_->CopySubresourceRegion(staging_.Get(), 0, 0, 0, 0, desktop, 0, &box);
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        checked(context_->Map(staging_.Get(), 0, D3D11_MAP_READ, 0, &mapped), "Map center crop");
+        struct Unmap {
+            ID3D11DeviceContext* context;
+            ID3D11Texture2D* texture;
+            ~Unmap() { context->Unmap(texture, 0); }
+        } unmap{context_.Get(), staging_.Get()};
+        frame.width = width;
+        frame.height = height;
+        frame.capture_ns = capture_ns;
+        frame.pixels.resize(size_t(width) * height * 4);
+        const size_t row_bytes = size_t(width) * 4;
+        for (uint16_t y = 0; y < height; ++y)
+            std::memcpy(frame.pixels.data() + size_t(y) * row_bytes,
+                        static_cast<const uint8_t*>(mapped.pData) + size_t(y) * mapped.RowPitch, row_bytes);
+        return true;
+    }
+};
+
+class DesktopCapture : public GpuCapture {
+    ComPtr<IDXGIOutputDuplication> duplication_;
+    bool protected_content_reported_ = false;
+
   public:
-    explicit DesktopCapture(unsigned output_index) {
-        auto available = outputs();
-        if (output_index >= available.size())
-            throw std::runtime_error("Output index is unavailable; run --list-outputs");
-        const auto& choice = available[output_index];
-        desktop_bounds_ = choice.description.DesktopCoordinates;
-        for (const auto ch : std::wstring(choice.description.DeviceName)) {
-            display_id_ ^= uint16_t(ch);
-            display_id_ *= 1099511628211ull;
-        }
-        constexpr D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
-        D3D_FEATURE_LEVEL selected{};
-        checked(D3D11CreateDevice(choice.adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
-                                  D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_SINGLETHREADED,
-                                  levels, UINT(std::size(levels)), D3D11_SDK_VERSION, &device_, &selected,
-                                  &context_),
-                "D3D11CreateDevice");
+    explicit DesktopCapture(unsigned output_index) : GpuCapture(output_index) {
         ComPtr<IDXGIOutput1> output1;
-        checked(choice.output.As(&output1), "Query IDXGIOutput1");
+        checked(choice_.output.As(&output1), "Query IDXGIOutput1");
         checked(output1->DuplicateOutput(device_.Get(), &duplication_), "DuplicateOutput");
-        duplication_->GetDesc(&duplication_description_);
-        if (duplication_description_.ModeDesc.Format != DXGI_FORMAT_B8G8R8A8_UNORM)
+        DXGI_OUTDUPL_DESC description{};
+        duplication_->GetDesc(&description);
+        if (description.ModeDesc.Format != DXGI_FORMAT_B8G8R8A8_UNORM)
             throw std::runtime_error("Desktop output is not available as lossless BGRA8");
-        if (duplication_description_.Rotation != DXGI_MODE_ROTATION_UNSPECIFIED &&
-            duplication_description_.Rotation != DXGI_MODE_ROTATION_IDENTITY)
+        if (description.Rotation != DXGI_MODE_ROTATION_UNSPECIFIED &&
+            description.Rotation != DXGI_MODE_ROTATION_IDENTITY)
             throw std::runtime_error(
                 "Rotated outputs are not supported; select a landscape output with no rotation");
-        std::cout << "Capturing output " << output_index << " (" << utf8(choice.description.DeviceName)
-                  << ", " << duplication_description_.ModeDesc.Width << 'x'
-                  << duplication_description_.ModeDesc.Height << ")\n";
     }
 
-    cursor_protocol::Sample geometry() const {
-        cursor_protocol::Sample s;
-        s.left = desktop_bounds_.left;
-        s.top = desktop_bounds_.top;
-        s.width = desktop_bounds_.right - desktop_bounds_.left;
-        s.height = desktop_bounds_.bottom - desktop_bounds_.top;
-        s.display = display_id_;
-        s.generation = 1;
-        return s;
-    }
-
-    bool fits(uint16_t width, uint16_t height) const {
-        return width <= duplication_description_.ModeDesc.Width &&
-               height <= duplication_description_.ModeDesc.Height;
-    }
-
-    bool next(CapturedFrame& frame, uint16_t width, uint16_t height, UINT timeout_ms = 16) {
+    bool next(CapturedFrame& frame, uint16_t width, uint16_t height) override {
+        check_monitor();
         if (!fits(width, height))
             throw std::runtime_error("Requested crop is larger than the selected output");
         DXGI_OUTDUPL_FRAME_INFO information{};
         ComPtr<IDXGIResource> resource;
-        HRESULT hr = duplication_->AcquireNextFrame(timeout_ms, &information, &resource);
+        HRESULT hr = duplication_->AcquireNextFrame(16, &information, &resource);
         if (hr == DXGI_ERROR_WAIT_TIMEOUT)
             return false;
         checked(hr, "AcquireNextFrame");
@@ -390,38 +474,200 @@ class DesktopCapture {
             return false;
         ComPtr<ID3D11Texture2D> desktop;
         checked(resource.As(&desktop), "Query desktop texture");
-        D3D11_TEXTURE2D_DESC source{};
-        desktop->GetDesc(&source);
-        if (source.Format != DXGI_FORMAT_B8G8R8A8_UNORM || width > source.Width || height > source.Height)
-            throw std::runtime_error("Desktop surface changed to an unsupported shape or format");
-        if (!staging_ || width != staging_width_ || height != staging_height_)
-            make_staging(width, height);
+        return read_crop(desktop.Get(), frame, width, height,
+                         qpc_to_ns(information.LastPresentTime.QuadPart));
+    }
+};
 
-        const UINT left = (source.Width - width) / 2;
-        const UINT top = (source.Height - height) / 2;
-        const D3D11_BOX crop{left, top, 0, left + width, top + height, 1};
-        context_->CopySubresourceRegion(staging_.Get(), 0, 0, 0, 0, desktop.Get(), 0, &crop);
+class GraphicsCapture : public GpuCapture {
+    struct Apartment {
+        Apartment() { winrt::init_apartment(winrt::apartment_type::multi_threaded); }
+        ~Apartment() { winrt::uninit_apartment(); }
+    } apartment_;
+    winrt::Windows::Graphics::Capture::GraphicsCaptureItem item_{nullptr};
+    winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice winrt_device_{nullptr};
+    winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool pool_{nullptr};
+    winrt::Windows::Graphics::Capture::GraphicsCaptureSession session_{nullptr};
+    std::shared_ptr<std::atomic<bool>> closed_ = std::make_shared<std::atomic<bool>>(false);
+    winrt::Windows::Graphics::Capture::GraphicsCaptureItem::Closed_revoker closed_revoker_;
 
-        D3D11_MAPPED_SUBRESOURCE mapped{};
-        checked(context_->Map(staging_.Get(), 0, D3D11_MAP_READ, 0, &mapped), "Map center crop");
-        struct Unmap {
-            ID3D11DeviceContext* context;
-            ID3D11Texture2D* texture;
-            ~Unmap() {
-                context->Unmap(texture, 0);
+  public:
+    explicit GraphicsCapture(unsigned output_index) try : GpuCapture(output_index) {
+        using namespace winrt::Windows::Graphics::Capture;
+        if (!GraphicsCaptureSession::IsSupported())
+            throw std::runtime_error("Windows Graphics Capture is unavailable on this system; try --capture dxgi or gdi");
+        auto interop = winrt::get_activation_factory<GraphicsCaptureItem, IGraphicsCaptureItemInterop>();
+        winrt::check_hresult(interop->CreateForMonitor(choice_.description.Monitor,
+            winrt::guid_of<GraphicsCaptureItem>(), winrt::put_abi(item_)));
+
+        ComPtr<IDXGIDevice> dxgi_device;
+        checked(device_.As(&dxgi_device), "Query WGC DXGI device");
+        winrt::com_ptr<IInspectable> inspectable;
+        winrt::check_hresult(CreateDirect3D11DeviceFromDXGIDevice(dxgi_device.Get(), inspectable.put()));
+        winrt_device_ = inspectable.as<winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice>();
+        pool_ = Direct3D11CaptureFramePool::CreateFreeThreaded(winrt_device_,
+            winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, item_.Size());
+        session_ = pool_.CreateCaptureSession(item_);
+        if (!session_.try_as<IGraphicsCaptureSession2>())
+            throw std::runtime_error("Cursor-free WGC requires Windows 10 2004 or newer; try --capture dxgi or gdi");
+        session_.IsCursorCaptureEnabled(false);
+        // Keep the system capture indicator and all Windows content protections.
+        closed_revoker_ = item_.Closed(winrt::auto_revoke,
+            [closed = closed_](const auto&, const auto&) { closed->store(true); });
+        session_.StartCapture();
+    } catch (const winrt::hresult_error& error) {
+        throw HrError(error.code(), "Initialize Windows Graphics Capture (requires Windows 10 2004+)");
+    }
+
+    ~GraphicsCapture() override {
+        // Stop the producer before releasing its pool, textures and apartment.
+        closed_revoker_.revoke();
+        try { if (session_) session_.Close(); } catch (...) {}
+        try { if (pool_) pool_.Close(); } catch (...) {}
+    }
+
+    bool next(CapturedFrame& frame, uint16_t width, uint16_t height) override {
+        try {
+            check_monitor();
+            if (!fits(width, height))
+                throw std::runtime_error("Requested crop is larger than the selected output");
+            const int64_t deadline = now_ns() + 16'000'000;
+            winrt::Windows::Graphics::Capture::Direct3D11CaptureFrame latest{nullptr};
+            do {
+                if (closed_->load())
+                    throw HrError(DXGI_ERROR_ACCESS_LOST, "WGC display closed");
+                latest = pool_.TryGetNextFrame();
+                if (latest)
+                    break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            } while (now_ns() < deadline);
+            if (!latest)
+                return false;
+            // Drain only the bounded pool, so a fast producer cannot starve sending.
+            if (auto newer = pool_.TryGetNextFrame()) {
+                latest.Close();
+                latest = std::move(newer);
             }
-        } unmap{context_.Get(), staging_.Get()};
+            struct CloseFrame {
+                winrt::Windows::Graphics::Capture::Direct3D11CaptureFrame& value;
+                ~CloseFrame() { try { value.Close(); } catch (...) {} }
+            } close{latest};
+            const auto size = latest.ContentSize();
+            const auto g = geometry();
+            if (size.Width != g.width || size.Height != g.height)
+                throw HrError(DXGI_ERROR_ACCESS_LOST, "WGC display size changed");
+            auto access = latest.Surface().as<::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
+            ComPtr<ID3D11Texture2D> texture;
+            winrt::check_hresult(access->GetInterface(IID_PPV_ARGS(&texture)));
+            // SystemRelativeTime is a QPC-based TimeSpan in 100 ns units.
+            return read_crop(texture.Get(), frame, width, height, latest.SystemRelativeTime().count() * 100);
+        } catch (const winrt::hresult_error& error) {
+            throw HrError(error.code(), "Acquire Windows Graphics Capture frame");
+        }
+    }
+};
+
+class GdiCapture : public Capture {
+    struct ScreenDc {
+        HDC value = nullptr;
+        ~ScreenDc() { if (value) ReleaseDC(nullptr, value); }
+    } screen_;
+    struct MemoryDc {
+        HDC value = nullptr;
+        ~MemoryDc() { if (value) DeleteDC(value); }
+    } memory_;
+    struct Dib {
+        HDC dc = nullptr;
+        HBITMAP bitmap = nullptr;
+        HGDIOBJ previous = nullptr;
+        void* pixels = nullptr;
+        uint16_t width = 0, height = 0;
+        void reset() {
+            if (previous) SelectObject(dc, previous);
+            if (bitmap) DeleteObject(bitmap);
+            previous = nullptr;
+            bitmap = nullptr;
+            pixels = nullptr;
+            width = height = 0;
+        }
+        ~Dib() { reset(); }
+    } dib_;
+    int64_t interval_ns_;
+    int64_t next_capture_ns_ = 0;
+
+    void make_dib(uint16_t width, uint16_t height) {
+        dib_.reset();
+        BITMAPINFO info{};
+        info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        info.bmiHeader.biWidth = width;
+        info.bmiHeader.biHeight = -LONG(height); // Top-down rows match DXGI and UVF1.
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+        dib_.bitmap = CreateDIBSection(screen_.value, &info, DIB_RGB_COLORS, &dib_.pixels, nullptr, 0);
+        if (!dib_.bitmap)
+            throw std::runtime_error("CreateDIBSection failed for GDI center crop");
+        dib_.dc = memory_.value;
+        const auto previous = SelectObject(dib_.dc, dib_.bitmap);
+        if (!previous || previous == HGDI_ERROR)
+            throw std::runtime_error("SelectObject failed for GDI center crop");
+        dib_.previous = previous;
+        dib_.width = width;
+        dib_.height = height;
+    }
+
+  public:
+    GdiCapture(unsigned output_index, double fps) : Capture(output_index),
+        interval_ns_(int64_t(1e9 / (fps > 0 ? fps : 60))) {
+        screen_.value = GetDC(nullptr);
+        if (!screen_.value)
+            throw std::runtime_error("Could not acquire the desktop DC for GDI capture");
+        memory_.value = CreateCompatibleDC(screen_.value);
+        if (!memory_.value)
+            throw std::runtime_error("CreateCompatibleDC failed for GDI capture");
+    }
+
+    bool next(CapturedFrame& frame, uint16_t width, uint16_t height) override {
+        check_monitor();
+        const auto g = geometry();
+        const auto crop = frame_sender::center_crop(g.width, g.height, width, height);
+        if (!crop)
+            throw std::runtime_error("Requested crop is larger than the selected output");
+        const int64_t now = now_ns();
+        if (now < next_capture_ns_) {
+            // Return at least every 16 ms for Ctrl+C and Receiver size updates.
+            std::this_thread::sleep_for(std::chrono::nanoseconds(
+                std::min<int64_t>(16'000'000, next_capture_ns_ - now)));
+            return false;
+        }
+        if (dib_.width != width || dib_.height != height)
+            make_dib(width, height);
+        // Capture physical screen coordinates, including monitors left/above primary.
+        if (!BitBlt(memory_.value, 0, 0, width, height, screen_.value,
+                    g.left + int(crop->left), g.top + int(crop->top), SRCCOPY | CAPTUREBLT) || !GdiFlush())
+            throw std::runtime_error("GDI desktop capture failed; check the interactive desktop session");
         frame.width = width;
         frame.height = height;
-        frame.capture_ns = qpc_to_ns(information.LastPresentTime.QuadPart);
+        frame.capture_ns = now_ns(); // GDI supplies no presentation timestamp.
+        next_capture_ns_ = frame.capture_ns + interval_ns_;
         frame.pixels.resize(size_t(width) * height * 4);
-        const size_t row_bytes = size_t(width) * 4;
-        for (uint16_t y = 0; y < height; ++y)
-            std::memcpy(frame.pixels.data() + size_t(y) * row_bytes,
-                        static_cast<const uint8_t*>(mapped.pData) + size_t(y) * mapped.RowPitch, row_bytes);
+        std::memcpy(frame.pixels.data(), dib_.pixels, frame.pixels.size());
+        // BI_RGB's fourth byte is undefined; publish an opaque BGRA alpha channel.
+        for (size_t i = 3; i < frame.pixels.size(); i += 4)
+            frame.pixels[i] = 255;
         return true;
     }
 };
+
+std::unique_ptr<Capture> make_capture(const Options& options) {
+    using frame_sender::CaptureMethod;
+    switch (options.capture_method) {
+    case CaptureMethod::dxgi: return std::make_unique<DesktopCapture>(options.output);
+    case CaptureMethod::wgc: return std::make_unique<GraphicsCapture>(options.output);
+    case CaptureMethod::gdi: return std::make_unique<GdiCapture>(options.output, options.fps);
+    }
+    throw std::runtime_error("Invalid capture method");
+}
 
 class Network {
     struct Winsock {
@@ -709,7 +955,7 @@ class ControlPlane {
         sample.crop_height = height;
         sample.crop_left = sample.left + (sample.width - width) / 2;
         sample.crop_top = sample.top + (sample.height - height) / 2;
-        sample.flags = 4;
+        sample.flags = width && height && stamp > 0 ? 4 : 0;
         sample.frame_sequence = sequence;
         sample.frame_ns = uint64_t(stamp);
         cursor_ = sample;
@@ -756,6 +1002,11 @@ int main(int argc, char** argv) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     try {
         const Options options = parse_options(argc, argv);
+        if (options.list_capture_methods) {
+            for (const auto& info : frame_sender::capture_methods)
+                std::cout << info.name << ": " << info.description << '\n';
+            return 0;
+        }
         if (options.list_outputs) {
             list_outputs();
             return 0;
@@ -766,7 +1017,10 @@ int main(int argc, char** argv) {
         }
         Network network(options.host, options.port, options.send_buffer_mib);
         const uint64_t session = random_session();
-        auto capture = std::make_unique<DesktopCapture>(options.output);
+        for (const auto& info : frame_sender::capture_methods)
+            if (info.method == options.capture_method)
+                std::cout << "Capture method: " << info.name << " - " << info.description << '\n';
+        auto capture = make_capture(options);
         uint16_t width = options.sync_resolution ? 0 : options.width;
         uint16_t height = options.sync_resolution ? 0 : options.height;
         if (!options.sync_resolution && !capture->fits(width, height))
@@ -817,14 +1071,17 @@ int main(int argc, char** argv) {
                 std::cerr << "Display changed; recreating desktop capture.\n";
                 capture.reset();
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                capture = std::make_unique<DesktopCapture>(options.output);
+                capture = make_capture(options);
+                if (width && height && !capture->fits(width, height))
+                    throw std::runtime_error("Crop is larger than the reconfigured output");
+                control.publish(capture->geometry(), 0, 0, 0, 0);
                 continue;
             }
             ++captured;
             const uint32_t frame_sequence = sequence++;
             if (control.desired() != std::pair{width, height}) {
                 ++skipped;
-                continue; // The request changed while DXGI was acquiring this frame.
+                continue; // The request changed while capture was acquiring this frame.
             }
             const int64_t now = now_ns();
             if ((interval && now < next_send) || now < backpressure_until) {
