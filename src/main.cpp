@@ -559,8 +559,10 @@ class GraphicsCapture : public GpuCapture {
             auto access = latest.Surface().as<::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
             ComPtr<ID3D11Texture2D> texture;
             winrt::check_hresult(access->GetInterface(IID_PPV_ARGS(&texture)));
-            // SystemRelativeTime is a QPC-based TimeSpan in 100 ns units.
-            return read_crop(texture.Get(), frame, width, height, latest.SystemRelativeTime().count() * 100);
+            // SystemRelativeTime is QPC-based, in 100 ns units. The compositor can
+            // predict a future presentation; never report capture after acquisition.
+            const int64_t stamp = std::min<int64_t>(latest.SystemRelativeTime().count() * 100, now_ns());
+            return read_crop(texture.Get(), frame, width, height, stamp);
         } catch (const winrt::hresult_error& error) {
             throw HrError(error.code(), "Acquire Windows Graphics Capture frame");
         }
