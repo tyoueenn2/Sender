@@ -51,7 +51,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Configure Windows SDK build
         run: cmake --preset windows-release
-      - name: Build capture and cursor feedback
+      - name: Build CLI, native GUI and capture engine
         run: cmake --build build --config ${{ matrix.configuration }} --parallel 2
       - name: Smoke test and cursor protocol regression checks
         run: |

@@ -6,6 +6,26 @@ FrameSender offers three documented Windows capture methods: DXGI Desktop Duplic
 
 FrameSender does not inject into another process or attempt to bypass protected-content, capture-blocking, or anti-cheat mechanisms. Content masked by Windows remains masked.
 
+## Desktop app
+
+Double-click **`frame_sender_gui.exe`** in the extracted Windows package. The GUI
+uses native Windows controls and the same capture engine as the command-line app;
+it requires no browser, web server, or additional GUI framework.
+
+1. Enter the Receiver PC's IPv4 address and UDP port.
+2. Choose a display and capture method. A description appears below the method.
+3. Leave **Follow Receiver's crop automatically** checked, or uncheck it and enter
+   an exact crop width and height (1–1024 pixels each).
+4. Optionally set a maximum FPS. Zero uses available DXGI/WGC frames, or 60 FPS
+   polling for GDI.
+5. Click **Start sending**. Activity shows waiting, capture statistics, and errors.
+   Click **Stop** to end the session; settings can then be changed for another run.
+
+The window stays responsive while sending. Closing it stops the active session
+and releases capture and networking resources. **Refresh** reloads the display
+list while stopped. Settings are validated before starting and are not saved
+between launches. The separate `frame_sender.exe` retains all CLI options below.
+
 ## Requirements
 
 - Windows 10 or Windows 11 x64.
@@ -27,12 +47,13 @@ Equivalent manual commands:
 
 ```powershell
 cmake --preset windows-release
-cmake --build --preset windows-release --target frame_sender
+cmake --build --preset windows-release --target frame_sender frame_sender_gui
 ```
 
-The executable is written to `build\Release\frame_sender.exe`.
+The executables are written to `build\Release\frame_sender_gui.exe` (desktop app)
+and `build\Release\frame_sender.exe` (CLI). The ZIP package includes both.
 
-The GitHub Actions workflow builds Windows Release and Debug, runs `--version`, the built-in `--self-test`, and the resolution/cursor protocol checks. Portable protocol checks also run on Linux in both configurations. Release builds upload a ZIP artifact, and each job retains diagnostics.
+The GitHub Actions workflow builds Windows Release and Debug, checks CLI and GUI initialization, validates shared settings, and runs the resolution/cursor protocol checks. Portable protocol checks also run on Linux in both configurations. Release builds upload a ZIP artifact, and each job retains diagnostics.
 
 To create a standalone ZIP containing the executable and README:
 

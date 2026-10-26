@@ -5,7 +5,7 @@ Push-Location $projectRoot
 try {
     cmake --preset windows-release
     if ($LASTEXITCODE -ne 0) { throw "CMake configuration failed" }
-    cmake --build --preset windows-release --target frame_sender
+    cmake --build --preset windows-release --target frame_sender frame_sender_gui
     if ($LASTEXITCODE -ne 0) { throw "FrameSender build failed" }
 }
 finally {
@@ -13,3 +13,4 @@ finally {
 }
 
 Write-Host "Built: $projectRoot\build\Release\frame_sender.exe"
+Write-Host "GUI:   $projectRoot\build\Release\frame_sender_gui.exe"
