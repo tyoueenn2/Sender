@@ -22,14 +22,23 @@ if(NOT WIN32)
   message(FATAL_ERROR "FrameSender requires Windows 10 or Windows 11 and Direct3D 11")
 endif()
 
-add_executable(frame_sender src/main.cpp)
-target_compile_features(frame_sender PRIVATE cxx_std_20)
-target_compile_definitions(frame_sender PRIVATE FRAME_SENDER_VERSION=\"${PROJECT_VERSION}\")
-target_compile_options(frame_sender PRIVATE
+add_library(frame_sender_core STATIC src/sender.cpp)
+target_compile_features(frame_sender_core PUBLIC cxx_std_20)
+target_compile_definitions(frame_sender_core PRIVATE FRAME_SENDER_VERSION=\"${PROJECT_VERSION}\")
+target_compile_options(frame_sender_core PRIVATE
   $<$<CXX_COMPILER_ID:MSVC>:/W4>
   $<$<CXX_COMPILER_ID:MSVC>:/permissive->)
-target_link_libraries(frame_sender PRIVATE d3d11 dxgi ws2_32 bcrypt user32 gdi32 windowsapp)
-target_compile_definitions(frame_sender PRIVATE _WIN32_WINNT=0x0A00)
+target_link_libraries(frame_sender_core PUBLIC d3d11 dxgi ws2_32 bcrypt user32 gdi32 windowsapp)
+target_compile_definitions(frame_sender_core PUBLIC _WIN32_WINNT=0x0A00)
+
+add_executable(frame_sender src/main.cpp)
+target_link_libraries(frame_sender PRIVATE frame_sender_core)
+add_executable(frame_sender_gui WIN32 src/gui.cpp)
+target_link_libraries(frame_sender_gui PRIVATE frame_sender_core comctl32)
+target_compile_definitions(frame_sender_gui PRIVATE UNICODE _UNICODE)
+target_compile_options(frame_sender_gui PRIVATE
+  $<$<CXX_COMPILER_ID:MSVC>:/W4>
+  $<$<CXX_COMPILER_ID:MSVC>:/permissive->)
 
 if(BUILD_TESTING)
   add_test(NAME frame_sender_capture_list COMMAND frame_sender --list-capture-methods)
@@ -40,9 +49,13 @@ if(BUILD_TESTING)
   add_test(NAME frame_sender_capture_invalid COMMAND frame_sender --capture unknown)
   add_test(NAME frame_sender_capture_missing COMMAND frame_sender --capture)
   set_tests_properties(frame_sender_capture_invalid frame_sender_capture_missing PROPERTIES WILL_FAIL TRUE)
+  add_test(NAME frame_sender_gui_controls COMMAND frame_sender_gui --self-test)
+  add_executable(frame_sender_settings_tests tests/settings_tests.cpp)
+  target_link_libraries(frame_sender_settings_tests PRIVATE frame_sender_core)
+  add_test(NAME frame_sender_settings COMMAND frame_sender_settings_tests)
 endif()
 
-install(TARGETS frame_sender RUNTIME DESTINATION .)
+install(TARGETS frame_sender frame_sender_gui RUNTIME DESTINATION .)
 install(FILES README.md DESTINATION .)
 install(FILES docs/PROTOCOL.md DESTINATION docs)
 
