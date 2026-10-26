@@ -96,6 +96,8 @@ Send a center crop matching Receiver's active model automatically:
 ```
 
 FrameSender waits for Receiver to finish loading its model before sending pixels.
+WGC starts its capture session when the first crop is ready, avoiding queued
+startup frames while Receiver loads.
 Changing the model or input size in Receiver updates the crop while both programs
 keep running. In color-only mode it follows Receiver's **Capture size** setting.
 Pixels remain an exact, unscaled BGRA center crop.

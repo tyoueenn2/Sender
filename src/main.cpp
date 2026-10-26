@@ -490,6 +490,7 @@ class GraphicsCapture : public GpuCapture {
     winrt::Windows::Graphics::Capture::GraphicsCaptureSession session_{nullptr};
     std::shared_ptr<std::atomic<bool>> closed_ = std::make_shared<std::atomic<bool>>(false);
     winrt::Windows::Graphics::Capture::GraphicsCaptureItem::Closed_revoker closed_revoker_;
+    bool started_ = false;
 
   public:
     explicit GraphicsCapture(unsigned output_index) try : GpuCapture(output_index) {
@@ -514,7 +515,6 @@ class GraphicsCapture : public GpuCapture {
         // Keep the system capture indicator and all Windows content protections.
         closed_revoker_ = item_.Closed(winrt::auto_revoke,
             [closed = closed_](const auto&, const auto&) { closed->store(true); });
-        session_.StartCapture();
     } catch (const winrt::hresult_error& error) {
         throw HrError(error.code(), "Initialize Windows Graphics Capture (requires Windows 10 2004+)");
     }
@@ -531,6 +531,11 @@ class GraphicsCapture : public GpuCapture {
             check_monitor();
             if (!fits(width, height))
                 throw std::runtime_error("Requested crop is larger than the selected output");
+            // Waiting for Receiver must not fill the pool with old startup frames.
+            if (!started_) {
+                session_.StartCapture();
+                started_ = true;
+            }
             const int64_t deadline = now_ns() + 16'000'000;
             winrt::Windows::Graphics::Capture::Direct3D11CaptureFrame latest{nullptr};
             do {
