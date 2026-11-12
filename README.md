@@ -12,7 +12,9 @@ Double-click **`frame_sender_gui.exe`** in the extracted Windows package. The GU
 uses native Windows controls and the same capture engine as the command-line app;
 it requires no browser, web server, or additional GUI framework.
 
-1. Enter the Receiver PC's IPv4 address and UDP port.
+1. Click **Find Receiver** to discover Receiver apps on your LAN. A single match
+   fills the IPv4 address and video UDP port automatically; for several matches,
+   choose an address from the dropdown. You can also enter the address and port.
 2. Choose a display and capture method. A description appears below the method.
 3. Leave **Follow Receiver's crop automatically** checked, or uncheck it and enter
    an exact crop width and height (1–1024 pixels each).
@@ -25,6 +27,14 @@ The window stays responsive while sending. Closing it stops the active session
 and releases capture and networking resources. **Refresh** reloads the display
 list while stopped. Settings are validated before starting and are not saved
 between launches. The separate `frame_sender.exe` retains all CLI options below.
+
+Discovery needs an updated Receiver running with the UDP video source selected.
+Its window can be open with the session stopped. Allow inbound UDP **39570** on
+the Receiver PC in addition to its video port. Discovery searches the local IPv4
+LAN for about two seconds; routers, guest Wi-Fi isolation, or a firewall can block
+broadcasts. Manual addressing remains available. Start the Receiver session and
+click **Start sending** after choosing the device. Receiver's `sender_ip` in
+`user-settings/setup.json` must still identify this sending PC.
 
 ## Requirements
 

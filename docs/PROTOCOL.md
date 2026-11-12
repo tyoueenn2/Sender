@@ -1,5 +1,26 @@
 # FrameSender wire protocol
 
+## LAN Receiver discovery
+
+The GUI's **Find Receiver** uses a separate ephemeral UDP socket to send `UVDQ`
+queries to LAN broadcast addresses and loopback on UDP **39570**. This does not
+start capture or claim the video session. Replies identify the video service port;
+the normal connected socket below is opened only after **Start sending**.
+
+All discovery integers use network byte order. The 16-byte query contains `UVDQ`
+at offset 0, version 1 at offset 4, three zero bytes at offset 5, and a random
+nonzero 64-bit nonce at offset 8. The 24-byte reply contains `UVDA` at offset 0,
+version 1 at offset 4, zero at offset 5, the video port (two bytes) at offset 6,
+the echoed nonce at offset 8, the bound IPv4 address at offset 16 (zero means use
+the reply's source address), and four reserved zero bytes at offset 20.
+
+Searches retry every 300 ms for 1600 ms. Wrong nonces, versions, lengths,
+reserved fields and zero video ports are rejected. Duplicate endpoints are
+merged and at most 32 results are shown. Discovery runs on the local IPv4 LAN;
+manual addressing supports networks that block broadcasts.
+
+## Connected video transport
+
 All integers use network byte order. Every message occupies one UDP datagram. FrameSender connects one UDP socket to the configured Receiver endpoint, so heartbeat, frame, clock, and resolution traffic share one stable source IP and port. The protocol is unauthenticated and intended for a trusted wired LAN.
 
 ## Sender heartbeat: UVH1
