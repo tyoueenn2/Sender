@@ -5,9 +5,11 @@
 #include <commctrl.h>
 #include <ws2tcpip.h>
 #include "sender.hpp"
+#include "lan_discovery.hpp"
 
 #include <algorithm>
 #include <iostream>
+#include <future>
 #include <mutex>
 #include <sstream>
 #include <streambuf>
@@ -22,7 +24,7 @@
 
 namespace {
 enum ControlId {
-    title = 100, subtitle, host_label, host, port_label, port, display_label, display,
+    title = 100, subtitle, host_label, host, discover, port_label, port, display_label, display,
     refresh, method_label, method, description, automatic, width_label, width,
     height_label, height, fps_label, fps, start, stop, status, log_label, activity
 };
@@ -79,6 +81,8 @@ class Window {
     HFONT font_ = nullptr, title_font_ = nullptr;
     UINT dpi_ = 96;
     std::vector<frame_sender::DisplayInfo> displays_;
+    std::future<std::vector<lan_discovery::Endpoint>> discovery_;
+    std::vector<lan_discovery::Endpoint> receivers_;
     std::thread worker_;
     std::atomic<bool> stop_{false}, finished_{false};
     int result_ = 0;
@@ -140,7 +144,8 @@ class Window {
         place(title, 24, 16, w - 48, 36);
         place(subtitle, 24, 58, w - 48, 24);
         place(host_label, 24, 98, w - 200, 22);
-        place(host, 24, 122, w - 192, 28);
+        place(host, 24, 122, w - 320, 220);
+        place(discover, w - 280, 122, 120, 28);
         place(port_label, w - 144, 98, 120, 22);
         place(port, w - 144, 122, 120, 28);
         place(display_label, 24, 166, w - 48, 22);
@@ -168,12 +173,27 @@ class Window {
             text(description, wide(frame_sender::capture_methods[size_t(index)].description).c_str());
     }
     void enable_settings(bool enable) {
-        for (int id : {host, port, display, refresh, method, automatic, fps})
+        for (int id : {host, discover, port, display, refresh, method, automatic, fps})
             EnableWindow(control(id), enable);
         EnableWindow(control(width), enable && !checked());
         EnableWindow(control(height), enable && !checked());
         EnableWindow(control(start), enable && !displays_.empty());
-        EnableWindow(control(stop), !enable && !closing_);
+        EnableWindow(control(stop), worker_.joinable() && !closing_ && !stop_.load());
+    }
+    void select_receiver(size_t index) {
+        if (index >= receivers_.size()) return;
+        const auto& endpoint = receivers_[index];
+        text(host, wide(endpoint.ip).c_str());
+        text(port, std::to_wstring(endpoint.port).c_str());
+        text(status, L"Receiver selected - ready to send");
+        append_log("Selected Receiver " + endpoint.ip + ":" + std::to_string(endpoint.port) + "\n");
+    }
+    void discover_receivers() {
+        if (worker_.joinable() || discovery_.valid()) return;
+        discovery_ = std::async(std::launch::async, [] { return lan_discovery::find_receivers(); });
+        enable_settings(false);
+        text(status, L"Searching for Receivers...");
+        append_log("Searching the local network for Receiver apps...\n");
     }
     void refresh_displays() {
         unsigned previous = 0;
@@ -199,7 +219,13 @@ class Window {
         enable_settings(true);
     }
     frame_sender::Options options() const {
-        const auto address = narrow(value(host));
+        auto address = narrow(value(host));
+        // Windows can display the selected dropdown row before its edit text is replaced.
+        for (const auto& receiver : receivers_)
+            if (address == receiver.ip + ":" + std::to_string(receiver.port)) {
+                address = receiver.ip;
+                break;
+            }
         IN_ADDR ipv4{};
         if (InetPtonA(AF_INET, address.c_str(), &ipv4) != 1)
             throw std::runtime_error("Enter a Receiver IPv4 address, for example 192.168.1.10.");
@@ -222,7 +248,7 @@ class Window {
         return frame_sender::parse_arguments(int(argv.size()), argv.data());
     }
     void start_sender() {
-        if (worker_.joinable()) return;
+        if (worker_.joinable() || discovery_.valid()) return;
         try {
             const auto settings = options();
             stop_.store(false);
@@ -258,6 +284,33 @@ class Window {
         if (original_error_) std::cerr.rdbuf(std::exchange(original_error_, nullptr));
     }
     void tick() {
+        if (discovery_.valid() && discovery_.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            try {
+                receivers_ = discovery_.get();
+                const auto previous = value(host);
+                SendMessageW(control(host), CB_RESETCONTENT, 0, 0);
+                for (const auto& receiver : receivers_) {
+                    const auto label = wide(receiver.ip + ":" + std::to_string(receiver.port));
+                    SendMessageW(control(host), CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
+                }
+                text(host, previous.c_str());
+                if (receivers_.size() == 1)
+                    select_receiver(0);
+                else if (receivers_.empty()) {
+                    text(status, L"No Receiver found");
+                    append_log("No Receiver found. Open an updated Receiver on the same LAN with UDP "
+                               "video selected, and allow inbound UDP 39570 through its firewall.\n");
+                } else {
+                    text(status, L"Choose a Receiver from the address list");
+                    enable_settings(true);
+                    SendMessageW(control(host), CB_SHOWDROPDOWN, TRUE, 0);
+                }
+            } catch (const std::exception& error) {
+                text(status, L"Discovery failed - see activity");
+                append_log(std::string(error.what()) + "\n");
+            }
+            enable_settings(true);
+        }
         const auto messages = buffer_.take();
         if (!messages.empty()) {
             append_log(messages);
@@ -287,7 +340,9 @@ class Window {
         add(title, L"STATIC", L"FrameSender");
         add(subtitle, L"STATIC", L"Send an exact desktop crop to your Receiver.");
         add(host_label, L"STATIC", L"Receiver &IPv4");
-        add(host, L"EDIT", L"127.0.0.1", WS_TABSTOP | ES_AUTOHSCROLL, WS_EX_CLIENTEDGE);
+        add(host, L"COMBOBOX", L"", WS_TABSTOP | CBS_DROPDOWN | CBS_AUTOHSCROLL | WS_VSCROLL);
+        text(host, L"127.0.0.1");
+        add(discover, L"BUTTON", L"&Find Receiver", WS_TABSTOP | BS_PUSHBUTTON);
         add(port_label, L"STATIC", L"UDP &port");
         add(port, L"EDIT", L"5000", WS_TABSTOP | ES_NUMBER, WS_EX_CLIENTEDGE);
         add(display_label, L"STATIC", L"&Display");
@@ -309,7 +364,7 @@ class Window {
         add(log_label, L"STATIC", L"Activity");
         add(activity, L"EDIT", L"", WS_TABSTOP | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL,
             WS_EX_CLIENTEDGE);
-        SendMessageW(control(host), EM_SETLIMITTEXT, 15, 0);
+        SendMessageW(control(host), CB_LIMITTEXT, 21, 0);
         for (int id : {port, width, height, fps})
             SendMessageW(control(id), EM_SETLIMITTEXT, 16, 0);
         SendMessageW(control(activity), EM_SETLIMITTEXT, 64 * 1024, 0);
@@ -321,7 +376,7 @@ class Window {
         layout();
         method_description();
         refresh_displays();
-        append_log("Choose your Receiver's IPv4 address, then click Start sending.\n"
+        append_log("Click Find Receiver or enter its IPv4 address, then click Start sending.\n"
                    "Automatic crop waits for Receiver to load its model.\n");
         if (!SetTimer(hwnd_, 1, 100, nullptr))
             throw std::runtime_error("Could not create the UI update timer");
@@ -362,10 +417,15 @@ class Window {
             case WM_COMMAND:
                 if (LOWORD(wp) == start && HIWORD(wp) == BN_CLICKED) self->start_sender();
                 if (LOWORD(wp) == stop && HIWORD(wp) == BN_CLICKED) self->request_stop();
-                if (LOWORD(wp) == refresh && HIWORD(wp) == BN_CLICKED && !self->worker_.joinable()) self->refresh_displays();
+                if (LOWORD(wp) == discover && HIWORD(wp) == BN_CLICKED) self->discover_receivers();
+                if (LOWORD(wp) == host && HIWORD(wp) == CBN_SELCHANGE) {
+                    const auto index = SendMessageW(self->control(host), CB_GETCURSEL, 0, 0);
+                    if (index >= 0) self->select_receiver(size_t(index));
+                }
+                if (LOWORD(wp) == refresh && HIWORD(wp) == BN_CLICKED && !self->worker_.joinable() && !self->discovery_.valid()) self->refresh_displays();
                 if (LOWORD(wp) == method && HIWORD(wp) == CBN_SELCHANGE) self->method_description();
                 if (LOWORD(wp) == automatic && HIWORD(wp) == BN_CLICKED)
-                    self->enable_settings(!self->worker_.joinable());
+                    self->enable_settings(!self->worker_.joinable() && !self->discovery_.valid());
                 return 0;
             case WM_TIMER: self->tick(); return 0;
             case WM_CLOSE:
@@ -407,6 +467,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
     // CI verifies native controls and defaults without starting capture/networking.
     if (std::wstring_view(command_line) == L"--self-test") {
         const bool valid = GetDlgItem(hwnd, start) && GetDlgItem(hwnd, activity) &&
+            GetDlgItem(hwnd, discover) && IsWindowEnabled(GetDlgItem(hwnd, discover)) &&
+            (GetWindowLongPtrW(GetDlgItem(hwnd, host), GWL_STYLE) & CBS_DROPDOWN) == CBS_DROPDOWN &&
             SendDlgItemMessageW(hwnd, method, CB_GETCOUNT, 0, 0) == 3 &&
             SendDlgItemMessageW(hwnd, automatic, BM_GETCHECK, 0, 0) == BST_CHECKED &&
             !IsWindowEnabled(GetDlgItem(hwnd, width)) && !IsWindowEnabled(GetDlgItem(hwnd, stop));
