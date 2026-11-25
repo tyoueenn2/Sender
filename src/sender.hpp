@@ -1,6 +1,7 @@
 #pragma once
 
 #include "capture_options.hpp"
+#include "send_progress.hpp"
 #include <atomic>
 #include <string>
 #include <vector>
@@ -28,6 +29,6 @@ struct DisplayInfo {
 
 std::vector<DisplayInfo> display_choices();
 Options parse_arguments(int argc, char** argv);
-int run_sender(const Options& options, std::atomic<bool>& stop);
+int run_sender(const Options& options, std::atomic<bool>& stop, VideoSendProgress* progress = nullptr);
 int run_cli(int argc, char** argv);
 } // namespace frame_sender

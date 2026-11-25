@@ -20,8 +20,11 @@ it requires no browser, web server, or additional GUI framework.
    an exact crop width and height (1–1024 pixels each).
 4. Optionally set a maximum FPS. Zero uses available DXGI/WGC frames, or 60 FPS
    polling for GDI.
-5. Click **Start sending**. Activity shows waiting, capture statistics, and errors.
-   Click **Stop** to end the session; settings can then be changed for another run.
+5. Click **Start sending**. Automatic crop waits for Receiver's crop size.
+   Both crop modes wait for the first frame to be sent. **Frames sent locally**
+   means the local UDP socket accepted all fragments of at least one frame;
+   verify that video actually arrives in Receiver's preview. Activity shows
+   capture statistics and errors. Click **Stop** to end the session.
 
 The window stays responsive while sending. Closing it stops the active session
 and releases capture and networking resources. **Refresh** reloads the display
@@ -35,6 +38,7 @@ LAN for about two seconds; routers, guest Wi-Fi isolation, or a firewall can blo
 broadcasts. Manual addressing remains available. Start the Receiver session and
 click **Start sending** after choosing the device. Receiver's `sender_ip` in
 `user-settings/setup.json` must still identify this sending PC.
+**Receiver found** confirms discovery only, not that a video session is active.
 
 ## Requirements
 
