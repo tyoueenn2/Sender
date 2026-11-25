@@ -11,6 +11,7 @@
 #include <iostream>
 #include <future>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <streambuf>
 #include <stdexcept>
@@ -26,7 +27,7 @@ namespace {
 enum ControlId {
     title = 100, subtitle, host_label, host, discover, port_label, port, display_label, display,
     refresh, method_label, method, description, automatic, width_label, width,
-    height_label, height, fps_label, fps, start, stop, status, log_label, activity
+    height_label, height, fps_label, fps, start, stop, status, status_hint, log_label, activity
 };
 
 std::wstring wide(const std::string_view value) {
@@ -85,6 +86,8 @@ class Window {
     std::vector<lan_discovery::Endpoint> receivers_;
     std::thread worker_;
     std::atomic<bool> stop_{false}, finished_{false};
+    frame_sender::VideoSendProgress send_progress_;
+    std::optional<frame_sender::VideoSendStage> displayed_stage_;
     int result_ = 0;
     bool closing_ = false;
     LogBuffer buffer_;
@@ -94,6 +97,33 @@ class Window {
     int scale(int value) const { return MulDiv(value, int(dpi_), 96); }
     HWND control(int id) const { return GetDlgItem(hwnd_, id); }
     void text(int id, const wchar_t* value) { SetWindowTextW(control(id), value); }
+    void show_feedback(const wchar_t* summary, const wchar_t* hint = L"") {
+        text(status, summary);
+        text(status_hint, hint);
+    }
+    void show_sender_progress() {
+        const auto stage = send_progress_.stage();
+        if (displayed_stage_ == stage) return;
+        displayed_stage_ = stage;
+        using frame_sender::VideoSendStage;
+        switch (stage) {
+        case VideoSendStage::starting:
+            show_feedback(L"Starting sender...");
+            break;
+        case VideoSendStage::waiting_for_crop:
+            show_feedback(L"Waiting for Receiver's crop",
+                L"Start Video Preview or a UDP session on Receiver. Its allowed Sender IPv4 must match this PC.");
+            break;
+        case VideoSendStage::waiting_for_first_frame:
+            show_feedback(L"Waiting to send the first frame",
+                L"If it stays here, try updating the desktop on the selected display.");
+            break;
+        case VideoSendStage::frames_sent_locally:
+            show_feedback(L"Frames sent locally",
+                L"UDP does not confirm delivery. Check the video preview in Receiver.");
+            break;
+        }
+    }
     bool checked() const { return SendMessageW(control(automatic), BM_GETCHECK, 0, 0) == BST_CHECKED; }
     std::wstring value(int id) const {
         const HWND field = control(id);
@@ -164,8 +194,9 @@ class Window {
         place(start, 24, 466, 140, 36);
         place(stop, 176, 466, 88, 36);
         place(status, 280, 473, w - 304, 28);
-        place(log_label, 24, 520, w - 48, 22);
-        place(activity, 24, 546, w - 48, std::max(64, h - 570));
+        place(status_hint, 24, 510, w - 48, 48);
+        place(log_label, 24, 570, w - 48, 22);
+        place(activity, 24, 596, w - 48, std::max(64, h - 620));
     }
     void method_description() {
         const auto index = SendMessageW(control(method), CB_GETCURSEL, 0, 0);
@@ -185,17 +216,25 @@ class Window {
         const auto& endpoint = receivers_[index];
         text(host, wide(endpoint.ip).c_str());
         text(port, std::to_wstring(endpoint.port).c_str());
-        text(status, L"Receiver selected - ready to send");
+        show_feedback(L"Receiver found",
+            L"Check the address and port, then click Start sending.");
         append_log("Selected Receiver " + endpoint.ip + ":" + std::to_string(endpoint.port) + "\n");
     }
     void discover_receivers() {
         if (worker_.joinable() || discovery_.valid()) return;
         discovery_ = std::async(std::launch::async, [] { return lan_discovery::find_receivers(); });
         enable_settings(false);
-        text(status, L"Searching for Receivers...");
+        show_feedback(L"Searching for Receivers...",
+            L"Discovery looks for open Receiver apps on the local network.");
         append_log("Searching the local network for Receiver apps...\n");
     }
+    void no_receiver_found() {
+        show_feedback(L"No Receiver found",
+            L"Open Receiver with UDP video on the same network. Check that its firewall allows "
+            L"inbound UDP 39570, or enter the IPv4 address and video port manually.");
+    }
     void refresh_displays() {
+        const bool had_display = !displays_.empty();
         unsigned previous = 0;
         const auto selected = SendMessageW(control(display), CB_GETCURSEL, 0, 0);
         if (selected >= 0 && size_t(selected) < displays_.size())
@@ -209,11 +248,14 @@ class Window {
                 if (displays_[i].index == previous) select = int(i);
             }
             SendMessageW(control(display), CB_SETCURSEL, WPARAM(select), 0);
-            text(status, displays_.empty() ? L"No attached display" : L"Ready");
+            if (displays_.empty())
+                show_feedback(L"No attached display", L"Connect a display, then click Refresh.");
+            else if (!had_display)
+                show_feedback(L"Ready", L"Find a Receiver or enter its IPv4 address and UDP port.");
         } catch (const std::exception& error) {
             displays_.clear();
             SendMessageW(control(display), CB_RESETCONTENT, 0, 0);
-            text(status, L"Display lookup failed");
+            show_feedback(L"Display lookup failed", L"Check Activity, then click Refresh to try again.");
             append_log(std::string(error.what()) + "\n");
         }
         enable_settings(true);
@@ -253,13 +295,15 @@ class Window {
             const auto settings = options();
             stop_.store(false);
             finished_.store(false);
+            send_progress_.reset();
+            displayed_stage_.reset();
             SetWindowTextW(control(activity), L"");
             buffer_.take();
             original_out_ = std::cout.rdbuf(&buffer_);
             original_error_ = std::cerr.rdbuf(&buffer_);
             try {
                 worker_ = std::thread([this, settings] {
-                    result_ = frame_sender::run_sender(settings, stop_);
+                    result_ = frame_sender::run_sender(settings, stop_, &send_progress_);
                     finished_.store(true, std::memory_order_release);
                 });
             } catch (...) {
@@ -267,9 +311,9 @@ class Window {
                 throw;
             }
             enable_settings(false);
-            text(status, L"Starting sender...");
+            show_sender_progress();
         } catch (const std::exception& error) {
-            text(status, L"Check settings");
+            show_feedback(L"Check settings", wide(error.what()).c_str());
             append_log(std::string(error.what()) + "\n");
         }
     }
@@ -277,7 +321,7 @@ class Window {
         if (!worker_.joinable()) return;
         stop_.store(true, std::memory_order_relaxed);
         EnableWindow(control(stop), FALSE);
-        text(status, L"Stopping...");
+        show_feedback(L"Stopping...");
     }
     void restore_streams() {
         if (original_out_) std::cout.rdbuf(std::exchange(original_out_, nullptr));
@@ -297,32 +341,25 @@ class Window {
                 if (receivers_.size() == 1)
                     select_receiver(0);
                 else if (receivers_.empty()) {
-                    text(status, L"No Receiver found");
+                    no_receiver_found();
                     append_log("No Receiver found. Open an updated Receiver on the same LAN with UDP "
                                "video selected, and allow inbound UDP 39570 through its firewall.\n");
                 } else {
-                    text(status, L"Choose a Receiver from the address list");
+                    show_feedback(L"Receivers found", L"Choose an address from the Receiver IPv4 list.");
                     enable_settings(true);
                     SendMessageW(control(host), CB_SHOWDROPDOWN, TRUE, 0);
                 }
             } catch (const std::exception& error) {
-                text(status, L"Discovery failed - see activity");
+                show_feedback(L"Discovery failed", L"Check Activity or enter the IPv4 address and video port manually.");
                 append_log(std::string(error.what()) + "\n");
             }
             enable_settings(true);
         }
         const auto messages = buffer_.take();
-        if (!messages.empty()) {
+        if (!messages.empty())
             append_log(messages);
-            if (!stop_.load()) {
-                if (messages.find("Waiting for Receiver") != std::string::npos)
-                    text(status, L"Waiting for Receiver's crop");
-                if (messages.find("Sending fixed") != std::string::npos ||
-                    messages.find("Receiver requested") != std::string::npos ||
-                    messages.find(" fps, sent ") != std::string::npos)
-                    text(status, L"Sending");
-            }
-        }
+        if (worker_.joinable() && !stop_.load(std::memory_order_relaxed))
+            show_sender_progress();
         if (worker_.joinable() && finished_.load(std::memory_order_acquire)) {
             worker_.join();
             restore_streams();
@@ -332,7 +369,10 @@ class Window {
                 return;
             }
             enable_settings(true);
-            text(status, result_ == 0 ? L"Stopped" : L"Sender failed - see activity");
+            if (result_ == 0)
+                show_feedback(L"Stopped");
+            else
+                show_feedback(L"Sender failed", L"Check Activity for the error before trying again.");
         }
     }
     void create() {
@@ -361,6 +401,7 @@ class Window {
         add(start, L"BUTTON", L"&Start sending", WS_TABSTOP | BS_DEFPUSHBUTTON);
         add(stop, L"BUTTON", L"S&top", WS_TABSTOP | BS_PUSHBUTTON);
         add(status, L"STATIC", L"Ready");
+        add(status_hint, L"STATIC", L"");
         add(log_label, L"STATIC", L"Activity");
         add(activity, L"EDIT", L"", WS_TABSTOP | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL,
             WS_EX_CLIENTEDGE);
@@ -383,6 +424,31 @@ class Window {
     }
 
   public:
+    // Called by the native entry point's --self-test, without starting capture or UDP.
+    bool self_test_feedback() {
+        no_receiver_found();
+        if (value(status) != L"No Receiver found" ||
+            value(status_hint).find(L"manually") == std::wstring::npos ||
+            value(host) != L"127.0.0.1" || value(port) != L"5000")
+            return false;
+        receivers_ = {{"192.0.2.10", 5001}};
+        select_receiver(0);
+        if (value(status) != L"Receiver found" || value(host) != L"192.0.2.10" || value(port) != L"5001")
+            return false;
+        SendMessageW(hwnd_, WM_COMMAND, MAKEWPARAM(host, CBN_EDITCHANGE),
+                     reinterpret_cast<LPARAM>(control(host)));
+        if (value(status) != L"Manual destination") return false;
+        send_progress_.capture_ready(true);
+        show_sender_progress();
+        if (value(status) != L"Waiting for Receiver's crop") return false;
+        send_progress_.crop_ready();
+        show_sender_progress();
+        if (value(status) != L"Waiting to send the first frame") return false;
+        send_progress_.first_frame_sent();
+        show_sender_progress();
+        return value(status) == L"Frames sent locally" &&
+               value(status_hint).find(L"does not confirm delivery") != std::wstring::npos;
+    }
     ~Window() {
         stop_.store(true);
         if (worker_.joinable()) worker_.join();
@@ -411,7 +477,7 @@ class Window {
             }
             case WM_GETMINMAXINFO: {
                 auto* limits = reinterpret_cast<MINMAXINFO*>(lp);
-                limits->ptMinTrackSize = {self->scale(656), self->scale(680)};
+                limits->ptMinTrackSize = {self->scale(656), self->scale(720)};
                 return 0;
             }
             case WM_COMMAND:
@@ -421,6 +487,11 @@ class Window {
                 if (LOWORD(wp) == host && HIWORD(wp) == CBN_SELCHANGE) {
                     const auto index = SendMessageW(self->control(host), CB_GETCURSEL, 0, 0);
                     if (index >= 0) self->select_receiver(size_t(index));
+                }
+                if ((LOWORD(wp) == host && HIWORD(wp) == CBN_EDITCHANGE) ||
+                    (LOWORD(wp) == port && HIWORD(wp) == EN_CHANGE)) {
+                    if (!self->worker_.joinable() && !self->discovery_.valid() && self->control(status))
+                        self->show_feedback(L"Manual destination", L"Check the IPv4 address and video port, then click Start sending.");
                 }
                 if (LOWORD(wp) == refresh && HIWORD(wp) == BN_CLICKED && !self->worker_.joinable() && !self->discovery_.valid()) self->refresh_displays();
                 if (LOWORD(wp) == method && HIWORD(wp) == CBN_SELCHANGE) self->method_description();
@@ -471,7 +542,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int show)
             (GetWindowLongPtrW(GetDlgItem(hwnd, host), GWL_STYLE) & CBS_DROPDOWN) == CBS_DROPDOWN &&
             SendDlgItemMessageW(hwnd, method, CB_GETCOUNT, 0, 0) == 3 &&
             SendDlgItemMessageW(hwnd, automatic, BM_GETCHECK, 0, 0) == BST_CHECKED &&
-            !IsWindowEnabled(GetDlgItem(hwnd, width)) && !IsWindowEnabled(GetDlgItem(hwnd, stop));
+            !IsWindowEnabled(GetDlgItem(hwnd, width)) && !IsWindowEnabled(GetDlgItem(hwnd, stop)) &&
+            state.self_test_feedback();
         DestroyWindow(hwnd);
         return valid ? 0 : 1;
     }

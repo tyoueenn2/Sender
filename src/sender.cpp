@@ -1043,7 +1043,7 @@ int frame_sender::run_cli(int argc, char** argv) {
     }
 }
 
-int frame_sender::run_sender(const Options& options, std::atomic<bool>& stop) {
+int frame_sender::run_sender(const Options& options, std::atomic<bool>& stop, VideoSendProgress* progress) {
     try {
         Network network(options.host, options.port, options.send_buffer_mib);
         const uint64_t session = random_session();
@@ -1057,6 +1057,8 @@ int frame_sender::run_sender(const Options& options, std::atomic<bool>& stop) {
             throw std::runtime_error("Initial crop is larger than the selected output");
         ControlPlane control(network.socket, session, options.width, options.height, options.sync_resolution,
                              capture->geometry());
+        if (progress)
+            progress->capture_ready(options.sync_resolution);
         if (options.sync_resolution)
             std::cout << "Waiting for Receiver's capture size at " << options.host << ':' << options.port
                       << ". Start Receiver with this PC's Sender IPv4 configured.\n";
@@ -1085,6 +1087,8 @@ int frame_sender::run_sender(const Options& options, std::atomic<bool>& stop) {
                     throw std::runtime_error("Receiver requested " + std::to_string(requested_width) + "x" +
                                              std::to_string(requested_height) +
                                              ", which is larger than the selected output");
+                if (progress && !width)
+                    progress->crop_ready();
                 width = requested_width;
                 height = requested_height;
                 next_send = backpressure_until = 0;
@@ -1122,6 +1126,8 @@ int frame_sender::run_sender(const Options& options, std::atomic<bool>& stop) {
             wire_bytes += result.bytes;
             if (result.complete) {
                 ++sent_frames;
+                if (progress && sent_frames == 1)
+                    progress->first_frame_sent();
                 control.publish(capture->geometry(), width, height, frame_sequence, frame.capture_ns);
             } else {
                 ++dropped;
