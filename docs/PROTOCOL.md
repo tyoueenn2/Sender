@@ -37,13 +37,13 @@ Receiver binds sender ownership to the source endpoint and session.
 
 ## Raw frame fragment: UVF1
 
-Each fragment contains a 48-byte header followed by up to 1352 bytes of uncompressed BGRA data:
+Each fragment contains a 48-byte header followed by up to 1352 bytes of uncompressed pixel data:
 
 | Offset | Bytes | Field |
 |---:|---:|---|
 | 0 | 4 | ASCII `UVF1` |
 | 4 | 1 | Version 1 |
-| 5 | 1 | Format 2, BGRA32 |
+| 5 | 1 | Format 2 for BGRA32 (default), 1 for RGB24 |
 | 6 | 2 | Header length 48 |
 | 8 | 8 | Sender session |
 | 16 | 4 | Frame sequence modulo 2³² |
@@ -56,9 +56,9 @@ Each fragment contains a 48-byte header followed by up to 1352 bytes of uncompre
 | 40 | 4 | Payload byte offset |
 | 44 | 2 | Fragment stride, 1352 |
 | 46 | 2 | Reserved, zero |
-| 48 | variable | Tightly packed BGRA bytes |
+| 48 | variable | Tightly packed pixel bytes |
 
-Rows run top-to-bottom with bytes ordered B, G, R, A. Width and height are each 1–1024. The total byte length is `width × height × 4`, fragment count is `ceil(total / 1352)`, and the last fragment carries only the remaining bytes. There is no retransmission: fresh frames take priority over incomplete old frames.
+Rows run top-to-bottom with bytes ordered B, G, R, A for BGRA32 or R, G, B for RGB24. Width and height are each 1–1024. The total byte length is width × height × bytes per pixel (4 for BGRA32 and 3 for RGB24), fragment count is `ceil(total / 1352)`, and the last fragment carries only the remaining bytes. There is no retransmission: fresh frames take priority over incomplete old frames.
 
 ## Clock synchronization: UVC1 and UVS1
 

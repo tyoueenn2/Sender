@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <iterator>
@@ -175,6 +176,7 @@ void usage() {
               << "  --output INDEX          desktop output from --list-outputs\n"
               << "  --capture METHOD        dxgi (default), wgc, or gdi\n"
               << "  --list-capture-methods  describe capture methods and exit\n"
+              << "  --pixel-format FORMAT  bgra (default) or rgb24\n"
               << "  --fps FPS               send cap; 0 = new frames (GDI polls at 60)\n"
               << "  --port PORT             Receiver frame port (default 5000)\n"
               << "  --send-buffer-mib MIB   UDP queue, 1..16 (default 2)\n"
@@ -214,6 +216,14 @@ Options parse_options(int argc, char** argv) {
             if (!method)
                 throw std::runtime_error("Unknown capture method: " + name + "; choose dxgi, wgc, or gdi");
             options.capture_method = *method;
+        } else if (argument == "--pixel-format") {
+            const auto format = next(i, "--pixel-format");
+            if (format == "bgra")
+                options.pixel_format = frame_sender::PixelFormat::bgra;
+            else if (format == "rgb24")
+                options.pixel_format = frame_sender::PixelFormat::rgb24;
+            else
+                throw std::runtime_error("Unknown pixel format: " + format + "; choose bgra or rgb24");
         } else if (argument == "--fps")
             options.fps = real(next(i, "--fps"), "fps", 1000);
         else if (argument == "--send-buffer-mib")
@@ -292,6 +302,7 @@ struct CapturedFrame {
     uint16_t width = 0;
     uint16_t height = 0;
     int64_t capture_ns = 0;
+    frame_sender::PixelFormat format = frame_sender::PixelFormat::bgra;
     std::vector<uint8_t> pixels;
 };
 
@@ -347,7 +358,8 @@ class Capture {
         return frame_sender::center_crop(s.width, s.height, width, height).has_value();
     }
 
-    virtual bool next(CapturedFrame& frame, uint16_t width, uint16_t height) = 0;
+    virtual bool next(CapturedFrame& frame, uint16_t width, uint16_t height,
+                      const std::function<bool()>& allow_readback) = 0;
 };
 
 class GpuCapture : public Capture {
@@ -434,7 +446,8 @@ class DesktopCapture : public GpuCapture {
                 "Rotated outputs are not supported; select a landscape output with no rotation");
     }
 
-    bool next(CapturedFrame& frame, uint16_t width, uint16_t height) override {
+    bool next(CapturedFrame& frame, uint16_t width, uint16_t height,
+              const std::function<bool()>& allow_readback) override {
         check_monitor();
         if (!fits(width, height))
             throw std::runtime_error("Requested crop is larger than the selected output");
@@ -458,7 +471,7 @@ class DesktopCapture : public GpuCapture {
         }
 
         // Pointer-only updates do not change the captured pixels.
-        if (!information.LastPresentTime.QuadPart)
+        if (!information.LastPresentTime.QuadPart || !allow_readback())
             return false;
         ComPtr<ID3D11Texture2D> desktop;
         checked(resource.As(&desktop), "Query desktop texture");
@@ -476,7 +489,13 @@ class GraphicsCapture : public GpuCapture {
     winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice winrt_device_{nullptr};
     winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool pool_{nullptr};
     winrt::Windows::Graphics::Capture::GraphicsCaptureSession session_{nullptr};
-    std::shared_ptr<std::atomic<bool>> closed_ = std::make_shared<std::atomic<bool>>(false);
+    struct FrameSignal {
+        HANDLE ready = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        std::atomic<bool> closed = false;
+        ~FrameSignal() { if (ready) CloseHandle(ready); }
+    };
+    std::shared_ptr<FrameSignal> signal_ = std::make_shared<FrameSignal>();
+    winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool::FrameArrived_revoker arrived_revoker_;
     winrt::Windows::Graphics::Capture::GraphicsCaptureItem::Closed_revoker closed_revoker_;
     bool started_ = false;
 
@@ -501,8 +520,14 @@ class GraphicsCapture : public GpuCapture {
             throw std::runtime_error("Cursor-free WGC requires Windows 10 2004 or newer; try --capture dxgi or gdi");
         session_.IsCursorCaptureEnabled(false);
         // Keep the system capture indicator and all Windows content protections.
-        closed_revoker_ = item_.Closed(winrt::auto_revoke,
-            [closed = closed_](const auto&, const auto&) { closed->store(true); });
+        if (!signal_->ready)
+            throw std::runtime_error("Could not create Windows Graphics Capture frame event");
+        arrived_revoker_ = pool_.FrameArrived(winrt::auto_revoke,
+            [signal = signal_](const auto&, const auto&) { SetEvent(signal->ready); });
+        closed_revoker_ = item_.Closed(winrt::auto_revoke, [signal = signal_](const auto&, const auto&) {
+            signal->closed = true;
+            SetEvent(signal->ready);
+        });
     } catch (const winrt::hresult_error& error) {
         throw HrError(error.code(), "Initialize Windows Graphics Capture (requires Windows 10 2004+)");
     }
@@ -510,11 +535,13 @@ class GraphicsCapture : public GpuCapture {
     ~GraphicsCapture() override {
         // Stop the producer before releasing its pool, textures and apartment.
         closed_revoker_.revoke();
+        arrived_revoker_.revoke();
         try { if (session_) session_.Close(); } catch (...) {}
         try { if (pool_) pool_.Close(); } catch (...) {}
     }
 
-    bool next(CapturedFrame& frame, uint16_t width, uint16_t height) override {
+    bool next(CapturedFrame& frame, uint16_t width, uint16_t height,
+              const std::function<bool()>& allow_readback) override {
         try {
             check_monitor();
             if (!fits(width, height))
@@ -524,16 +551,17 @@ class GraphicsCapture : public GpuCapture {
                 session_.StartCapture();
                 started_ = true;
             }
-            const int64_t deadline = now_ns() + 16'000'000;
-            winrt::Windows::Graphics::Capture::Direct3D11CaptureFrame latest{nullptr};
-            do {
-                if (closed_->load())
+            if (signal_->closed)
+                throw HrError(DXGI_ERROR_ACCESS_LOST, "WGC display closed");
+            auto latest = pool_.TryGetNextFrame();
+            if (!latest) {
+                const DWORD status = WaitForSingleObject(signal_->ready, 16);
+                if (status == WAIT_FAILED)
+                    throw std::runtime_error("Windows Graphics Capture frame wait failed");
+                if (signal_->closed)
                     throw HrError(DXGI_ERROR_ACCESS_LOST, "WGC display closed");
                 latest = pool_.TryGetNextFrame();
-                if (latest)
-                    break;
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            } while (now_ns() < deadline);
+            }
             if (!latest)
                 return false;
             // Drain only the bounded pool, so a fast producer cannot starve sending.
@@ -549,6 +577,8 @@ class GraphicsCapture : public GpuCapture {
             const auto g = geometry();
             if (size.Width != g.width || size.Height != g.height)
                 throw HrError(DXGI_ERROR_ACCESS_LOST, "WGC display size changed");
+            if (!allow_readback())
+                return false;
             auto access = latest.Surface().as<::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
             ComPtr<ID3D11Texture2D> texture;
             winrt::check_hresult(access->GetInterface(IID_PPV_ARGS(&texture)));
@@ -622,7 +652,8 @@ class GdiCapture : public Capture {
             throw std::runtime_error("CreateCompatibleDC failed for GDI capture");
     }
 
-    bool next(CapturedFrame& frame, uint16_t width, uint16_t height) override {
+    bool next(CapturedFrame& frame, uint16_t width, uint16_t height,
+              const std::function<bool()>& allow_readback) override {
         check_monitor();
         const auto g = geometry();
         const auto crop = frame_sender::center_crop(g.width, g.height, width, height);
@@ -635,6 +666,9 @@ class GdiCapture : public Capture {
                 std::min<int64_t>(16'000'000, next_capture_ns_ - now)));
             return false;
         }
+        next_capture_ns_ = now + interval_ns_;
+        if (!allow_readback())
+            return false;
         if (dib_.width != width || dib_.height != height)
             make_dib(width, height);
         // Capture physical screen coordinates, including monitors left/above primary.
@@ -752,7 +786,7 @@ std::array<uint8_t, frame_header_size> encode_frame_header(const CapturedFrame& 
     std::array<uint8_t, frame_header_size> header{};
     std::memcpy(header.data(), "UVF1", 4);
     header[4] = 1;
-    header[5] = 2; // Exact desktop BGRA8; no conversion or compression.
+    header[5] = uint8_t(frame.format);
     put16(header.data() + 6, uint16_t(frame_header_size));
     put64(header.data() + 8, session);
     put32(header.data() + 16, sequence);
@@ -822,6 +856,13 @@ void self_test() {
         get16(header.data() + 44) == frame_stride && get16(header.data() + 46) == 0;
     if (!valid)
         throw std::runtime_error("UVF1 wire self-test failed");
+    frame.format = frame_sender::PixelFormat::rgb24;
+    frame.pixels.resize(frame_sender::pack_rgb24(frame.pixels));
+    const uint16_t rgb_count = uint16_t((frame.pixels.size() + frame_stride - 1) / frame_stride);
+    const auto rgb_header = encode_frame_header(frame, session, 0x89abcdefu, 0, rgb_count, 0);
+    if (rgb_header[5] != 1 || get32(rgb_header.data() + 32) != uint32_t(frame.width) * frame.height * 3 ||
+        get16(rgb_header.data() + 38) != rgb_count)
+        throw std::runtime_error("UVF1 RGB24 wire self-test failed");
     std::cout << "FrameSender wire self-test passed (" << count << " fragments for 320x160 BGRA).\n";
 }
 
@@ -1063,8 +1104,9 @@ int frame_sender::run_sender(const Options& options, std::atomic<bool>& stop, Vi
             std::cout << "Waiting for Receiver's capture size at " << options.host << ':' << options.port
                       << ". Start Receiver with this PC's Sender IPv4 configured.\n";
         else
-            std::cout << "Sending fixed center crop " << width << 'x' << height << " BGRA to " << options.host
+            std::cout << "Sending fixed center crop " << width << 'x' << height << " to " << options.host
                       << ':' << options.port << "\n";
+        std::cout << "Pixel format: " << (options.pixel_format == PixelFormat::rgb24 ? "RGB24" : "BGRA") << '\n';
 
         CapturedFrame frame;
         uint32_t sequence = 0;
@@ -1072,7 +1114,20 @@ int frame_sender::run_sender(const Options& options, std::atomic<bool>& stop, Vi
         uint64_t previous_captured = 0, previous_sent = 0, previous_bytes = 0;
         int64_t report_at = now_ns() + 1'000'000'000;
         int64_t next_send = 0, backpressure_until = 0;
-        const int64_t interval = options.fps > 0 ? int64_t(1e9 / options.fps) : 0;
+        const int64_t interval = options.fps > 0 && options.capture_method != CaptureMethod::gdi
+                                     ? int64_t(1e9 / options.fps) : 0;
+        int64_t acquired_at = 0;
+        const std::function<bool()> allow_readback = [&] {
+            ++captured;
+            ++sequence;
+            acquired_at = now_ns();
+            if (stop.load(std::memory_order_relaxed) || control.desired() != std::pair{width, height} ||
+                acquired_at < next_send || acquired_at < backpressure_until) {
+                ++skipped;
+                return false;
+            }
+            return true;
+        };
 
         while (!stop.load(std::memory_order_relaxed) && !control.stopped()) {
             auto [requested_width, requested_height] = control.desired();
@@ -1095,7 +1150,7 @@ int frame_sender::run_sender(const Options& options, std::atomic<bool>& stop, Vi
                 std::cout << "Receiver requested exact center crop " << width << 'x' << height << "\n";
             }
             try {
-                if (!capture->next(frame, width, height))
+                if (!capture->next(frame, width, height, allow_readback))
                     continue;
             } catch (const HrError& error) {
                 if (error.value != DXGI_ERROR_ACCESS_LOST)
@@ -1109,18 +1164,16 @@ int frame_sender::run_sender(const Options& options, std::atomic<bool>& stop, Vi
                 control.publish(capture->geometry(), 0, 0, 0, 0);
                 continue;
             }
-            ++captured;
-            const uint32_t frame_sequence = sequence++;
+            const uint32_t frame_sequence = sequence - 1;
             if (control.desired() != std::pair{width, height}) {
                 ++skipped;
                 continue; // The request changed while capture was acquiring this frame.
             }
             const int64_t now = now_ns();
-            if ((interval && now < next_send) || now < backpressure_until) {
-                ++skipped;
-                continue;
-            }
-            next_send = interval ? now + interval : 0;
+            next_send = interval ? acquired_at + interval : 0;
+            frame.format = options.pixel_format;
+            if (frame.format == PixelFormat::rgb24)
+                frame.pixels.resize(pack_rgb24(frame.pixels));
             const SendResult result = send_frame(network.socket, frame, session, frame_sequence);
             datagrams += result.datagrams;
             wire_bytes += result.bytes;
