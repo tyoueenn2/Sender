@@ -87,7 +87,7 @@ reports an error instead of silently changing capture behavior.
 |---|---|---|
 | `dxgi` (default) | DXGI Desktop Duplication reads the composed desktop through Direct3D 11 and copies just the center crop to staging memory. | Suited to high-refresh desktop capture. Sends new desktop presentations and preserves their QPC timestamp. Rejects rotated duplication surfaces. Hardware cursor shapes are not added to the image. |
 | `wgc` | Windows Graphics Capture creates a system-managed monitor capture session, using a two-frame GPU pool and the same crop readback as DXGI. | Requires Windows 10 2004+; excludes the cursor and retains Windows' capture border. Sends available frames with system timestamps capped at acquisition time. Windows or display policy can deny capture. BGRA8 capture of HDR content can differ from DXGI; use SDR for consistent color comparisons. |
-| `gdi` | GDI `BitBlt` copies the visible center crop, including layered windows, into a CPU-readable 32-bit top-down bitmap. | Compatibility option with higher CPU overhead and possible missing hardware overlays or exclusive fullscreen content. Takes repeated snapshots, including on a static desktop, at 60 FPS by default or the requested `--fps` rate. Timestamps mark completion of the copy, and the undefined bitmap alpha byte is set to 255. |
+| `gdi` | GDI `BitBlt` copies the visible center crop, including layered windows, into a CPU-readable 32-bit top-down bitmap. | Compatibility option with higher CPU overhead and possible missing hardware overlays or exclusive fullscreen content. Takes repeated snapshots, including on a static desktop, at 60 FPS by default or the requested `--fps` rate. Timestamps mark the start of the copy, and the undefined bitmap alpha byte is set to 255. |
 
 All methods use Windows APIs from FrameSender's own process, with no injection,
 hooks, drivers, or changes to the captured application. Protected, excluded, or
@@ -165,7 +165,7 @@ Receiver must allow inbound UDP on the selected frame port and configure **Sende
 
 ## Latency behavior
 
-- DXGI uses its presentation timestamp, WGC uses its system-relative frame timestamp capped at acquisition time, and GDI uses the copy-completion timestamp. WGC's compositor can predict a future presentation; the cap prevents negative capture latency. All timestamps are expressed in monotonic nanoseconds for Receiver's clock synchronization.
+- DXGI uses its presentation timestamp, WGC uses its system-relative frame timestamp capped at acquisition time, and GDI uses the copy-start timestamp. WGC's compositor can predict a future presentation; the cap prevents negative capture latency. All timestamps are expressed in monotonic nanoseconds for Receiver's clock synchronization.
 - Capture and packetization favor the newest desktop image. The FPS cap and
   socket recovery checks run before the GPU crop readback or GDI copy.
 - Windows Graphics Capture wakes on a frame notification. It drains at most

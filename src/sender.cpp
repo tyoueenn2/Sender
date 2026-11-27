@@ -672,13 +672,14 @@ class GdiCapture : public Capture {
         if (dib_.width != width || dib_.height != height)
             make_dib(width, height);
         // Capture physical screen coordinates, including monitors left/above primary.
+        const auto capture_started = now_ns(); // GDI supplies no presentation timestamp.
         if (!BitBlt(memory_.value, 0, 0, width, height, screen_.value,
                     g.left + int(crop->left), g.top + int(crop->top), SRCCOPY | CAPTUREBLT) || !GdiFlush())
             throw std::runtime_error("GDI desktop capture failed; check the interactive desktop session");
         frame.width = width;
         frame.height = height;
-        frame.capture_ns = now_ns(); // GDI supplies no presentation timestamp.
-        next_capture_ns_ = frame.capture_ns + interval_ns_;
+        frame.capture_ns = capture_started;
+        next_capture_ns_ = now_ns() + interval_ns_;
         frame.pixels.resize(size_t(width) * height * 4);
         std::memcpy(frame.pixels.data(), dib_.pixels, frame.pixels.size());
         // BI_RGB's fourth byte is undefined; publish an opaque BGRA alpha channel.
