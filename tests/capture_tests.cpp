@@ -1,4 +1,5 @@
 #include "../src/capture_options.hpp"
+#include "../src/frame_notification.hpp"
 
 #include <iostream>
 #include <limits>
@@ -44,6 +45,16 @@ int main() {
                   "Invalid crop was accepted");
         crop = center_crop(std::numeric_limits<uint32_t>::max(), 1080, 1, 1);
         check(crop && crop->left == 2147483647u, "Large source dimensions overflowed");
+        FrameNotification notification;
+        const auto initial = notification.snapshot();
+        notification.frame_arrived();
+        const auto arrived = notification.wait(initial.sequence, FrameNotification::Clock::now());
+        check(arrived.sequence == initial.sequence + 1 && !arrived.closed, "Lost an early frame notification");
+        const auto idle = notification.wait(arrived.sequence, FrameNotification::Clock::now());
+        check(idle.sequence == arrived.sequence && !idle.closed, "Idle wait changed notification state");
+        notification.close();
+        check(notification.wait(idle.sequence, FrameNotification::Clock::now()).closed,
+              "Closure did not satisfy the wait predicate");
         std::cout << "Capture selection, descriptions and exact center-crop geometry passed\n";
         return 0;
     } catch (const std::exception& error) {

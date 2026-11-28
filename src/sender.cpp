@@ -17,6 +17,7 @@
 #include <windows.graphics.capture.interop.h>
 #include <windows.graphics.directx.direct3d11.interop.h>
 #include "capture_options.hpp"
+#include "frame_notification.hpp"
 #include "sender.hpp"
 #include "resolution.hpp"
 #include "cursor.hpp"
@@ -476,7 +477,9 @@ class GraphicsCapture : public GpuCapture {
     winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice winrt_device_{nullptr};
     winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool pool_{nullptr};
     winrt::Windows::Graphics::Capture::GraphicsCaptureSession session_{nullptr};
-    std::shared_ptr<std::atomic<bool>> closed_ = std::make_shared<std::atomic<bool>>(false);
+    using Notification = frame_sender::FrameNotification;
+    std::shared_ptr<Notification> notification_ = std::make_shared<Notification>();
+    winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool::FrameArrived_revoker frame_revoker_;
     winrt::Windows::Graphics::Capture::GraphicsCaptureItem::Closed_revoker closed_revoker_;
     bool started_ = false;
 
@@ -502,13 +505,16 @@ class GraphicsCapture : public GpuCapture {
         session_.IsCursorCaptureEnabled(false);
         // Keep the system capture indicator and all Windows content protections.
         closed_revoker_ = item_.Closed(winrt::auto_revoke,
-            [closed = closed_](const auto&, const auto&) { closed->store(true); });
+            [notice = notification_](const auto&, const auto&) { notice->close(); });
+        frame_revoker_ = pool_.FrameArrived(winrt::auto_revoke,
+            [notice = notification_](const auto&, const auto&) { notice->frame_arrived(); });
     } catch (const winrt::hresult_error& error) {
         throw HrError(error.code(), "Initialize Windows Graphics Capture (requires Windows 10 2004+)");
     }
 
     ~GraphicsCapture() override {
         // Stop the producer before releasing its pool, textures and apartment.
+        frame_revoker_.revoke();
         closed_revoker_.revoke();
         try { if (session_) session_.Close(); } catch (...) {}
         try { if (pool_) pool_.Close(); } catch (...) {}
@@ -524,18 +530,20 @@ class GraphicsCapture : public GpuCapture {
                 session_.StartCapture();
                 started_ = true;
             }
-            const int64_t deadline = now_ns() + 16'000'000;
+            const auto deadline = Notification::Clock::now() + std::chrono::milliseconds(16);
             winrt::Windows::Graphics::Capture::Direct3D11CaptureFrame latest{nullptr};
-            do {
-                if (closed_->load())
+            auto observed = notification_->snapshot();
+            for (;;) {
+                if (observed.closed)
                     throw HrError(DXGI_ERROR_ACCESS_LOST, "WGC display closed");
+                if (Notification::Clock::now() >= deadline)
+                    return false;
                 latest = pool_.TryGetNextFrame();
                 if (latest)
                     break;
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            } while (now_ns() < deadline);
-            if (!latest)
-                return false;
+                // An arrival during TryGetNextFrame makes the predicate immediately true.
+                observed = notification_->wait(observed.sequence, deadline);
+            }
             // Drain only the bounded pool, so a fast producer cannot starve sending.
             if (auto newer = pool_.TryGetNextFrame()) {
                 latest.Close();
