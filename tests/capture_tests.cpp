@@ -1,6 +1,7 @@
 #include "../src/capture_options.hpp"
 #include "../src/frame_notification.hpp"
 
+#include <algorithm>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -24,6 +25,12 @@ int main() {
             for (size_t j = 0; j < i; ++j)
                 check(info.name != capture_methods[j].name, "Duplicate method name");
         }
+
+        std::array<uint8_t, 12> pixels{1, 2, 3, 255, 4, 5, 6, 0, 7, 8, 9, 128};
+        const auto rgb_size = pack_rgb24(pixels);
+        const std::array<uint8_t, 9> rgb{3, 2, 1, 6, 5, 4, 9, 8, 7};
+        check(rgb_size == rgb.size() && std::ranges::equal(rgb, std::span(pixels).first(rgb_size)),
+              "In-place RGB24 conversion changed pixel ordering");
 
         auto crop = center_crop(1920, 1080, 320, 320);
         check(crop && crop->left == 800 && crop->top == 380 &&

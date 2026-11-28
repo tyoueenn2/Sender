@@ -1,8 +1,10 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string_view>
 
 namespace frame_sender {
@@ -30,6 +32,19 @@ inline std::optional<CaptureMethod> parse_capture_method(std::string_view name) 
         if (info.name == name)
             return info.method;
     return std::nullopt;
+}
+
+enum class PixelFormat : uint8_t { rgb24 = 1, bgra = 2 };
+
+inline size_t pack_rgb24(std::span<uint8_t> bgra) {
+    size_t out = 0;
+    for (size_t i = 0; i < bgra.size() / 4 * 4; i += 4) {
+        const auto blue = bgra[i], green = bgra[i + 1], red = bgra[i + 2];
+        bgra[out++] = red;
+        bgra[out++] = green;
+        bgra[out++] = blue;
+    }
+    return out;
 }
 
 struct Crop {

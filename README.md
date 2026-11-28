@@ -2,7 +2,7 @@
 
 Standalone Windows software for sending an exact, uncompressed center crop of a desktop display to the UDP Vision Receiver on another PC.
 
-FrameSender offers three documented Windows capture methods: DXGI Desktop Duplication (the default), Windows Graphics Capture, and GDI BitBlt. Each sends an unscaled center crop as raw BGRA8 UVF1 UDP fragments. CUDA is not required. DXGI and WGC copy only the crop into a CPU-readable GPU staging texture; GDI copies the crop into a top-down bitmap.
+FrameSender offers three documented Windows capture methods: DXGI Desktop Duplication (the default), Windows Graphics Capture, and GDI BitBlt. Each sends an unscaled center crop as raw BGRA8 UVF1 UDP fragments by default. CUDA is not required. DXGI and WGC copy only the crop into a CPU-readable GPU staging texture; GDI copies the crop into a top-down bitmap.
 
 FrameSender does not inject into another process or attempt to bypass protected-content, capture-blocking, or anti-cheat mechanisms. Content masked by Windows remains masked.
 
@@ -87,7 +87,7 @@ reports an error instead of silently changing capture behavior.
 |---|---|---|
 | `dxgi` (default) | DXGI Desktop Duplication reads the composed desktop through Direct3D 11 and copies just the center crop to staging memory. | Suited to high-refresh desktop capture. Sends new desktop presentations and preserves their QPC timestamp. Rejects rotated duplication surfaces. Hardware cursor shapes are not added to the image. |
 | `wgc` | Windows Graphics Capture creates a system-managed monitor capture session, using a two-frame GPU pool and the same crop readback as DXGI. | Requires Windows 10 2004+; excludes the cursor and retains Windows' capture border. Sends available frames with system timestamps capped at acquisition time. Windows or display policy can deny capture. BGRA8 capture of HDR content can differ from DXGI; use SDR for consistent color comparisons. |
-| `gdi` | GDI `BitBlt` copies the visible center crop, including layered windows, into a CPU-readable 32-bit top-down bitmap. | Compatibility option with higher CPU overhead and possible missing hardware overlays or exclusive fullscreen content. Takes repeated snapshots, including on a static desktop, at 60 FPS by default or the requested `--fps` rate. Timestamps mark completion of the copy, and the undefined bitmap alpha byte is set to 255. |
+| `gdi` | GDI `BitBlt` copies the visible center crop, including layered windows, into a CPU-readable 32-bit top-down bitmap. | Compatibility option with higher CPU overhead and possible missing hardware overlays or exclusive fullscreen content. Takes repeated snapshots, including on a static desktop, at 60 FPS by default or the requested `--fps` rate. Timestamps mark the start of the copy, and the undefined bitmap alpha byte is set to 255. |
 
 All methods use Windows APIs from FrameSender's own process, with no injection,
 hooks, drivers, or changes to the captured application. Protected, excluded, or
@@ -156,6 +156,7 @@ Useful options:
 | `--fps N` | Maximum send rate; zero sends available DXGI/WGC frames, while GDI polls at 60 FPS |
 | `--output N` | Display index reported by `--list-outputs` |
 | `--port N` | Receiver UDP frame port; default 5000 |
+| `--pixel-format FORMAT` | Send `bgra` (default) or packed `rgb24` |
 | `--send-buffer-mib N` | UDP queue size, 1–16 MiB; default 2 |
 | `--self-test` | Verify UVF1 wire encoding without opening capture or networking |
 | `--version` | Print the FrameSender version |
@@ -164,8 +165,13 @@ Receiver must allow inbound UDP on the selected frame port and configure **Sende
 
 ## Latency behavior
 
-- DXGI uses its presentation timestamp, WGC uses its system-relative frame timestamp capped at acquisition time, and GDI uses the copy-completion timestamp. WGC's compositor can predict a future presentation; the cap prevents negative capture latency. All timestamps are expressed in monotonic nanoseconds for Receiver's clock synchronization.
-- Capture and packetization always favor the newest desktop image.
+- DXGI uses its presentation timestamp, WGC uses its system-relative frame timestamp capped at acquisition time, and GDI uses the copy-start timestamp. WGC's compositor can predict a future presentation; the cap prevents negative capture latency. All timestamps are expressed in monotonic nanoseconds for Receiver's clock synchronization.
+- Capture and packetization favor the newest desktop image. The FPS cap and
+  socket recovery checks run before the GPU crop readback or GDI copy.
+- Windows Graphics Capture wakes on a frame notification. It drains at most
+  two frames per acquisition and keeps the newest one.
+- Opt in to `--pixel-format rgb24` for 25% fewer pixel bytes. It preserves
+  RGB channel values and drops alpha, with an in-place CPU conversion.
 - Heartbeats and clock synchronization use an independent control thread.
 - UDP datagrams stay at or below 1400 bytes to avoid IPv4 fragmentation with a normal 1500-byte MTU.
 - A full socket never blocks capture behind stale pixels. The partial frame is abandoned and a short drain interval allows a later fresh frame to complete.

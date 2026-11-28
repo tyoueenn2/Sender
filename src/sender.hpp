@@ -14,6 +14,7 @@ struct Options {
     uint16_t height = 320;
     unsigned output = 0;
     CaptureMethod capture_method = CaptureMethod::dxgi;
+    PixelFormat pixel_format = PixelFormat::bgra;
     double fps = 0;
     int send_buffer_mib = 2;
     bool sync_resolution = true;
